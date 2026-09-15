@@ -34,7 +34,7 @@ const TARGETS = Object.freeze({
     apiProcess: 'arwa-mizantra-api',
     webProcess: 'arwa-mizantra-web',
     apiPort: '4002',
-    webPort: '3003',
+    webPort: '3004',
     publicUrl: 'https://arwa.mizantra.ae',
     databaseProjectRef: 'igwbnjjepprmmhutrvej',
   }),

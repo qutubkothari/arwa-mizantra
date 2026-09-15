@@ -7,7 +7,7 @@ Dedicated Mizantra Manufacturing ERP deployment for Arwa, Egypt.
 - Application: https://arwa.mizantra.ae
 - Server root: `/var/www/arwa-mizantra`
 - API: PM2 `arwa-mizantra-api`, port `4002`
-- Web: PM2 `arwa-mizantra-web`, port `3003`
+- Web: PM2 `arwa-mizantra-web`, port `3004`
 - Database: dedicated Arwa Supabase project
 
 The repository contains no production credentials. Use `apps/api/.env.arwa.example` as the server-side environment template and keep the populated `.env` outside Git.

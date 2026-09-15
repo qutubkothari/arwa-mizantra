@@ -7,7 +7,7 @@
 | Public URL | `https://arwa.mizantra.ae` |
 | Git repository | `qutubkothari/arwa-mizantra` |
 | Server root | `/var/www/arwa-mizantra` |
-| Web process / port | `arwa-mizantra-web` / `3003` |
+| Web process / port | `arwa-mizantra-web` / `3004` |
 | API process / port | `arwa-mizantra-api` / `4002` |
 | Database project | Dedicated Supabase project `igwbnjjepprmmhutrvej` |
 | Market | Egypt |
