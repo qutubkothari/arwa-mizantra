@@ -1,5 +1,16 @@
 # Arwa Mizantra Project Handover
 
+## Provisioning status — 15 September 2026
+
+- Application repository created and pushed at commit `4057295`.
+- Dedicated application deployed and running under separate PM2 processes.
+- Domain and HTTPS certificate activated; automatic renewal timer is enabled.
+- Public login page and API access boundary verified.
+- Public database structure cloned: 468 tables, 9 views and 80 functions, including constraints, indexes, triggers and RLS policies.
+- Shared feature catalogue seeded with 96 records.
+- Isolation verified after provisioning: 0 tenants and 0 users; no Saif business data was copied.
+- Arwa organisation, administrator, client masters and opening balances remain onboarding activities because client-approved identities and source data have not yet been supplied.
+
 ## Deployment architecture
 
 | Area | Arwa environment |
