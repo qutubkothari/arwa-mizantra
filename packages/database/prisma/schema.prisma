@@ -1,0 +1,1229 @@
+// Prisma schema for Mizantra ERP by SAK Solutions
+// Multi-tenant, Multi-plant, Multi-language Architecture
+
+generator client {
+  provider        = "prisma-client-js"
+  previewFeatures = ["fullTextSearch", "fullTextIndex", "postgresqlExtensions"]
+}
+
+datasource db {
+  provider   = "postgresql"
+  url        = env("DATABASE_URL")
+  extensions = [pgcrypto, uuid_ossp]
+}
+
+// ============================================================================
+// CORE TENANT & AUTHENTICATION
+// ============================================================================
+
+model Tenant {
+  id           String   @id @default(uuid()) @db.Uuid
+  code         String   @unique @db.VarChar(20) // e.g., "SAIF-KOL"
+  name         String   @db.VarChar(200)
+  displayName  String   @db.VarChar(200)
+  domain       String?  @db.VarChar(100)
+  timezone     String   @default("Asia/Kolkata") @db.VarChar(50)
+  currency     String   @default("INR") @db.VarChar(10)
+  language     String   @default("en") @db.VarChar(10)
+  status       TenantStatus @default(ACTIVE)
+  features     Json     @default("{}")
+  settings     Json     @default("{}")
+  metadata     Json     @default("{}")
+  createdAt    DateTime @default(now())
+  updatedAt    DateTime @updatedAt
+  deletedAt    DateTime?
+
+  // Relations
+  companies    Company[]
+  users        User[]
+  plants       Plant[]
+  subscriptions Subscription[]
+
+  @@index([code])
+  @@index([status])
+  @@map("tenants")
+}
+
+enum TenantStatus {
+  ACTIVE
+  SUSPENDED
+  TRIAL
+  INACTIVE
+}
+
+model Company {
+  id              String   @id @default(uuid()) @db.Uuid
+  tenantId        String   @db.Uuid
+  code            String   @db.VarChar(20)
+  name            String   @db.VarChar(200)
+  legalName       String   @db.VarChar(200)
+  registrationNo  String?  @db.VarChar(100)
+  taxId           String?  @db.VarChar(50)
+  address         Json
+  contactInfo     Json
+  status          Status   @default(ACTIVE)
+  metadata        Json     @default("{}")
+  createdAt       DateTime @default(now())
+  updatedAt       DateTime @updatedAt
+
+  // Relations
+  tenant          Tenant   @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+  plants          Plant[]
+
+  @@unique([tenantId, code])
+  @@index([tenantId])
+  @@map("companies")
+}
+
+model Plant {
+  id              String   @id @default(uuid()) @db.Uuid
+  tenantId        String   @db.Uuid
+  companyId       String   @db.Uuid
+  code            String   @db.VarChar(20)
+  name            String   @db.VarChar(200)
+  type            PlantType
+  address         Json
+  contactInfo     Json
+  status          Status   @default(ACTIVE)
+  settings        Json     @default("{}")
+  metadata        Json     @default("{}")
+  createdAt       DateTime @default(now())
+  updatedAt       DateTime @updatedAt
+
+  // Relations
+  tenant          Tenant   @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+  company         Company  @relation(fields: [companyId], references: [id], onDelete: Cascade)
+  departments     Department[]
+  warehouses      Warehouse[]
+
+  @@unique([tenantId, companyId, code])
+  @@index([tenantId, companyId])
+  @@map("plants")
+}
+
+enum PlantType {
+  MANUFACTURING
+  WAREHOUSE
+  OFFICE
+  SERVICE_CENTER
+  R_AND_D
+}
+
+model Department {
+  id          String   @id @default(uuid()) @db.Uuid
+  tenantId    String   @db.Uuid
+  plantId     String   @db.Uuid
+  code        String   @db.VarChar(20)
+  name        String   @db.VarChar(200)
+  type        DepartmentType
+  managerId   String?  @db.Uuid
+  status      Status   @default(ACTIVE)
+  metadata    Json     @default("{}")
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+
+  // Relations
+  plant       Plant    @relation(fields: [plantId], references: [id], onDelete: Cascade)
+  manager     User?    @relation("DepartmentManager", fields: [managerId], references: [id])
+  employees   User[]   @relation("DepartmentEmployees")
+
+  @@unique([tenantId, plantId, code])
+  @@index([tenantId, plantId])
+  @@map("departments")
+}
+
+enum DepartmentType {
+  PURCHASE
+  STORES
+  PRODUCTION
+  QUALITY
+  SALES
+  SERVICE
+  HR
+  ACCOUNTS
+  ADMIN
+  R_AND_D
+}
+
+model User {
+  id              String   @id @default(uuid()) @db.Uuid
+  tenantId        String   @db.Uuid
+  email           String   @unique @db.VarChar(255)
+  username        String?  @unique @db.VarChar(100)
+  passwordHash    String
+  firstName       String   @db.VarChar(100)
+  lastName        String   @db.VarChar(100)
+  phone           String?  @db.VarChar(20)
+  avatar          String?
+  language        String   @default("en") @db.VarChar(10)
+  timezone        String   @default("Asia/Kolkata") @db.VarChar(50)
+  status          UserStatus @default(ACTIVE)
+  emailVerified   DateTime?
+  lastLoginAt     DateTime?
+  metadata        Json     @default("{}")
+  createdAt       DateTime @default(now())
+  updatedAt       DateTime @updatedAt
+  deletedAt       DateTime?
+
+  // Relations
+  tenant          Tenant   @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+  roles           UserRole[]
+  departmentId    String?  @db.Uuid
+  department      Department? @relation("DepartmentEmployees", fields: [departmentId], references: [id])
+  managedDepts    Department[] @relation("DepartmentManager")
+  sessions        UserSession[]
+  auditLogs       AuditLog[]
+  attendanceRecords Attendance[]
+
+  @@index([tenantId])
+  @@index([email])
+  @@index([status])
+  @@map("users")
+}
+
+enum UserStatus {
+  ACTIVE
+  INACTIVE
+  SUSPENDED
+  LOCKED
+}
+
+model Role {
+  id          String   @id @default(uuid()) @db.Uuid
+  tenantId    String?  @db.Uuid // null = system role
+  code        String   @db.VarChar(50)
+  name        String   @db.VarChar(100)
+  description String?
+  permissions Json     @default("[]")
+  isSystem    Boolean  @default(false)
+  status      Status   @default(ACTIVE)
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+
+  // Relations
+  users       UserRole[]
+
+  @@unique([tenantId, code])
+  @@index([tenantId])
+  @@map("roles")
+}
+
+model UserRole {
+  id        String   @id @default(uuid()) @db.Uuid
+  userId    String   @db.Uuid
+  roleId    String   @db.Uuid
+  assignedAt DateTime @default(now())
+  assignedBy String?  @db.Uuid
+  expiresAt  DateTime?
+
+  // Relations
+  user      User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  role      Role     @relation(fields: [roleId], references: [id], onDelete: Cascade)
+
+  @@unique([userId, roleId])
+  @@index([userId])
+  @@index([roleId])
+  @@map("user_roles")
+}
+
+model UserSession {
+  id          String   @id @default(uuid()) @db.Uuid
+  userId      String   @db.Uuid
+  token       String   @unique
+  refreshToken String? @unique
+  ipAddress   String?  @db.VarChar(45)
+  userAgent   String?
+  expiresAt   DateTime
+  createdAt   DateTime @default(now())
+
+  // Relations
+  user        User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([userId])
+  @@index([token])
+  @@map("user_sessions")
+}
+
+// ============================================================================
+// UID TRACKING & TRACEABILITY
+// ============================================================================
+
+model UidRegistry {
+  id          String   @id @default(uuid()) @db.Uuid
+  uid         String   @unique @db.VarChar(30)
+  tenantId    String   @db.Uuid
+  plantId     String   @db.Uuid
+  entityType  EntityType
+  entityId    String   @db.Uuid
+  
+  // Hierarchical Assembly Tracking - CRITICAL for multi-level assembly
+  parentUids  Json     @default("[]") // Array of parent UIDs used in assembly
+  childUids   Json     @default("[]") // Array of child UIDs created from this
+  assemblyLevel Int    @default(0)    // 0=raw material, increases with assembly
+  workstation String?  @db.VarChar(100) // Which workstation assembled this
+  assembledBy String?  @db.Uuid       // User who performed assembly
+  assemblyDate DateTime?              // When assembly occurred
+  
+  // Supplier Traceability - Track back to original supplier
+  supplierId  String?  @db.Uuid       // Original supplier
+  purchaseOrderId String? @db.Uuid    // PO reference
+  grnId       String?  @db.Uuid       // GRN reference
+  batchNumber String?  @db.VarChar(50)
+  unitPrice   Decimal? @db.Decimal(15, 2) // Price (role-based visibility)
+  
+  // Status & Location
+  status      UidStatus @default(ACTIVE)
+  location    String?
+  
+  // Lifecycle & Quality
+  lifecycle   Json     @default("[]")
+  qualityStatus String? @db.VarChar(50) // PASSED, FAILED, PENDING
+  defectNotes Json     @default("[]")   // Track quality issues
+  
+  // Metadata
+  metadata    Json     @default("{}")
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+
+  @@index([tenantId, plantId])
+  @@index([entityType, entityId])
+  @@index([uid])
+  @@index([supplierId])
+  @@index([purchaseOrderId])
+  @@index([assemblyLevel])
+  @@map("uid_registry")
+}
+
+enum EntityType {
+  RAW_MATERIAL
+  COMPONENT
+  SUB_ASSEMBLY
+  FINISHED_GOODS
+  DEMO_UNIT
+  SERVICE_SPARE
+  TOOL
+  EQUIPMENT
+}
+
+enum UidStatus {
+  ACTIVE
+  IN_USE
+  CONSUMED
+  SOLD
+  SCRAPPED
+  RETURNED
+  UNDER_SERVICE
+}
+
+// ============================================================================
+// MASTER DATA
+// ============================================================================
+
+model Item {
+  id              String   @id @default(uuid()) @db.Uuid
+  tenantId        String   @db.Uuid
+  code            String   @db.VarChar(50)
+  name            String   @db.VarChar(200)
+  description     String?
+  type            ItemType
+  category        String?  @db.VarChar(100)
+  subCategory     String?  @db.VarChar(100)
+  uom             String   @db.VarChar(20) // Unit of Measure
+  hsnCode         String?  @db.VarChar(20)
+  reorderLevel    Decimal? @db.Decimal(12, 2)
+  leadTimeDays    Int?
+  isActive        Boolean  @default(true)
+  specifications  Json     @default("{}")
+  metadata        Json     @default("{}")
+  createdAt       DateTime @default(now())
+  updatedAt       DateTime @updatedAt
+
+  // Relations
+  bomHeader       BomHeader[]
+  bomItems        BomItem[]
+  purchaseOrderItems PurchaseOrderItem[]
+  purchaseRequisitionItems PurchaseRequisitionItem[]
+  stockEntries    StockEntry[]
+
+  @@unique([tenantId, code])
+  @@index([tenantId])
+  @@index([type])
+  @@map("items")
+}
+
+enum ItemType {
+  RAW_MATERIAL
+  COMPONENT
+  SUB_ASSEMBLY
+  FINISHED_GOODS
+  CONSUMABLE
+  TOOL
+  SERVICE
+}
+
+model Vendor {
+  id              String   @id @default(uuid()) @db.Uuid
+  tenantId        String   @db.Uuid
+  code            String   @db.VarChar(50)
+  name            String   @db.VarChar(200)
+  legalName       String   @db.VarChar(200)
+  taxId           String?  @db.VarChar(50)
+  category        String?  @db.VarChar(100)
+  rating          Decimal? @db.Decimal(3, 2)
+  address         Json
+  contactInfo     Json
+  bankDetails     Json?
+  status          Status   @default(ACTIVE)
+  metadata        Json     @default("{}")
+  createdAt       DateTime @default(now())
+  updatedAt       DateTime @updatedAt
+
+  // Relations
+  purchaseOrders  PurchaseOrder[]
+
+  @@unique([tenantId, code])
+  @@index([tenantId])
+  @@map("vendors")
+}
+
+model Customer {
+  id              String   @id @default(uuid()) @db.Uuid
+  tenantId        String   @db.Uuid
+  code            String   @db.VarChar(50)
+  name            String   @db.VarChar(200)
+  legalName       String?  @db.VarChar(200)
+  taxId           String?  @db.VarChar(50)
+  category        String?  @db.VarChar(100)
+  address         Json
+  contactInfo     Json
+  creditLimit     Decimal? @db.Decimal(15, 2)
+  paymentTerms    String?  @db.VarChar(100)
+  status          Status   @default(ACTIVE)
+  metadata        Json     @default("{}")
+  createdAt       DateTime @default(now())
+  updatedAt       DateTime @updatedAt
+
+  // Relations
+  salesOrders     SalesOrder[]
+  serviceTickets  ServiceTicket[]
+
+  @@unique([tenantId, code])
+  @@index([tenantId])
+  @@map("customers")
+}
+
+// ============================================================================
+// PURCHASE MODULE
+// ============================================================================
+
+model PurchaseRequisition {
+  id              String   @id @default(uuid()) @db.Uuid
+  tenantId        String   @db.Uuid
+  plantId         String   @db.Uuid
+  prNumber        String   @db.VarChar(50)
+  requestedBy     String   @db.Uuid
+  departmentId    String   @db.Uuid
+  purpose         String?
+  priority        Priority @default(MEDIUM)
+  status          WorkflowStatus @default(DRAFT)
+  approvalChain   Json     @default("[]")
+  requestDate     DateTime @default(now())
+  requiredDate    DateTime
+  metadata        Json     @default("{}")
+  createdAt       DateTime @default(now())
+  updatedAt       DateTime @updatedAt
+
+  // Relations
+  items           PurchaseRequisitionItem[]
+  approvals       WorkflowApproval[]
+
+  @@unique([tenantId, prNumber])
+  @@index([tenantId, plantId])
+  @@index([status])
+  @@map("purchase_requisitions")
+}
+
+model PurchaseRequisitionItem {
+  id              String   @id @default(uuid()) @db.Uuid
+  prId            String   @db.Uuid
+  itemId          String   @db.Uuid
+  quantity        Decimal  @db.Decimal(12, 3)
+  uom             String   @db.VarChar(20)
+  estimatedPrice  Decimal? @db.Decimal(15, 2)
+  specifications  String?
+  notes           String?
+  createdAt       DateTime @default(now())
+
+  // Relations
+  pr              PurchaseRequisition @relation(fields: [prId], references: [id], onDelete: Cascade)
+  item            Item     @relation(fields: [itemId], references: [id])
+
+  @@index([prId])
+  @@map("purchase_requisition_items")
+}
+
+model PurchaseOrder {
+  id              String   @id @default(uuid()) @db.Uuid
+  tenantId        String   @db.Uuid
+  plantId         String   @db.Uuid
+  poNumber        String   @db.VarChar(50)
+  vendorId        String   @db.Uuid
+  orderDate       DateTime @default(now())
+  deliveryDate    DateTime
+  paymentTerms    String?  @db.VarChar(100)
+  status          PoStatus @default(DRAFT)
+  totalAmount     Decimal  @db.Decimal(15, 2)
+  taxAmount       Decimal  @db.Decimal(15, 2)
+  grandTotal      Decimal  @db.Decimal(15, 2)
+  currency        String   @default("INR") @db.VarChar(10)
+  notes           String?
+  tallyPushed     Boolean  @default(false)
+  tallyRef        String?
+  metadata        Json     @default("{}")
+  createdAt       DateTime @default(now())
+  updatedAt       DateTime @updatedAt
+
+  // Relations
+  vendor          Vendor   @relation(fields: [vendorId], references: [id])
+  items           PurchaseOrderItem[]
+  grns            GoodsReceiptNote[]
+  approvals       WorkflowApproval[]
+
+  @@unique([tenantId, poNumber])
+  @@index([tenantId, plantId])
+  @@index([vendorId])
+  @@index([status])
+  @@map("purchase_orders")
+}
+
+model PurchaseOrderItem {
+  id              String   @id @default(uuid()) @db.Uuid
+  poId            String   @db.Uuid
+  itemId          String   @db.Uuid
+  quantity        Decimal  @db.Decimal(12, 3)
+  uom             String   @db.VarChar(20)
+  unitPrice       Decimal  @db.Decimal(15, 2)
+  taxRate         Decimal  @db.Decimal(5, 2)
+  discount        Decimal? @db.Decimal(5, 2)
+  totalAmount     Decimal  @db.Decimal(15, 2)
+  receivedQty     Decimal  @default(0) @db.Decimal(12, 3)
+  specifications  String?
+  notes           String?
+  createdAt       DateTime @default(now())
+
+  // Relations
+  po              PurchaseOrder @relation(fields: [poId], references: [id], onDelete: Cascade)
+  item            Item     @relation(fields: [itemId], references: [id])
+
+  @@index([poId])
+  @@map("purchase_order_items")
+}
+
+model GoodsReceiptNote {
+  id              String   @id @default(uuid()) @db.Uuid
+  tenantId        String   @db.Uuid
+  plantId         String   @db.Uuid
+  grnNumber       String   @db.VarChar(50)
+  poId            String   @db.Uuid
+  receivedDate    DateTime @default(now())
+  receivedBy      String   @db.Uuid
+  warehouseId     String   @db.Uuid
+  inspectionStatus InspectionStatus @default(PENDING)
+  status          Status   @default(ACTIVE)
+  notes           String?
+  metadata        Json     @default("{}")
+  createdAt       DateTime @default(now())
+  updatedAt       DateTime @updatedAt
+
+  // Relations
+  po              PurchaseOrder @relation(fields: [poId], references: [id])
+  items           GrnItem[]
+
+  @@unique([tenantId, grnNumber])
+  @@index([tenantId, plantId])
+  @@index([poId])
+  @@map("goods_receipt_notes")
+}
+
+model GrnItem {
+  id              String   @id @default(uuid()) @db.Uuid
+  grnId           String   @db.Uuid
+  itemId          String   @db.Uuid
+  uid             String?  @db.VarChar(30) // Auto-generated UID
+  quantity        Decimal  @db.Decimal(12, 3)
+  uom             String   @db.VarChar(20)
+  unitPrice       Decimal  @db.Decimal(15, 2) // Price per unit (role-based visibility)
+  totalPrice      Decimal  @db.Decimal(15, 2) // Total price
+  acceptedQty     Decimal? @db.Decimal(12, 3)
+  rejectedQty     Decimal? @db.Decimal(12, 3)
+  batchNumber     String?  @db.VarChar(50)
+  location        String?  @db.VarChar(100)
+  inspectionNotes String?
+  supplierId      String   @db.Uuid // Link to supplier for traceability
+  createdAt       DateTime @default(now())
+
+  // Relations
+  grn             GoodsReceiptNote @relation(fields: [grnId], references: [id], onDelete: Cascade)
+
+  @@index([grnId])
+  @@index([uid])
+  @@index([supplierId])
+  @@map("grn_items")
+}
+
+// ============================================================================
+// INVENTORY / STORES MODULE
+// ============================================================================
+
+model Warehouse {
+  id          String   @id @default(uuid()) @db.Uuid
+  tenantId    String   @db.Uuid
+  plantId     String   @db.Uuid
+  code        String   @db.VarChar(20)
+  name        String   @db.VarChar(200)
+  type        WarehouseType
+  address     Json?
+  status      Status   @default(ACTIVE)
+  metadata    Json     @default("{}")
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+
+  // Relations
+  plant       Plant    @relation(fields: [plantId], references: [id])
+  stockEntries StockEntry[]
+
+  @@unique([tenantId, plantId, code])
+  @@index([tenantId, plantId])
+  @@map("warehouses")
+}
+
+enum WarehouseType {
+  RAW_MATERIAL
+  WIP
+  FINISHED_GOODS
+  DEMO
+  SERVICE_SPARES
+  TOOLS
+}
+
+model StockEntry {
+  id              String   @id @default(uuid()) @db.Uuid
+  tenantId        String   @db.Uuid
+  plantId         String   @db.Uuid
+  warehouseId     String   @db.Uuid
+  itemId          String   @db.Uuid
+  uid             String?  @db.VarChar(30)
+  transactionType StockTransactionType
+  referenceType   String?  @db.VarChar(50) // GRN, PO, SO, etc.
+  referenceId     String?  @db.Uuid
+  quantity        Decimal  @db.Decimal(12, 3)
+  uom             String   @db.VarChar(20)
+  batchNumber     String?  @db.VarChar(50)
+  location        String?  @db.VarChar(100)
+  transactionDate DateTime @default(now())
+  createdBy       String   @db.Uuid
+  notes           String?
+  metadata        Json     @default("{}")
+  createdAt       DateTime @default(now())
+
+  // Relations
+  warehouse       Warehouse @relation(fields: [warehouseId], references: [id])
+  item            Item     @relation(fields: [itemId], references: [id])
+
+  @@index([tenantId, plantId, warehouseId])
+  @@index([itemId])
+  @@index([uid])
+  @@index([transactionDate])
+  @@map("stock_entries")
+}
+
+enum StockTransactionType {
+  RECEIPT
+  ISSUE
+  RETURN
+  TRANSFER
+  ADJUSTMENT
+  SCRAP
+  DEMO_ISSUE
+  DEMO_RETURN
+}
+
+// ============================================================================
+// PRODUCTION MODULE
+// ============================================================================
+
+model BomHeader {
+  id              String   @id @default(uuid()) @db.Uuid
+  tenantId        String   @db.Uuid
+  productId       String   @db.Uuid
+  version         String   @db.VarChar(20)
+  description     String?
+  status          Status   @default(ACTIVE)
+  validFrom       DateTime
+  validTo         DateTime?
+  metadata        Json     @default("{}")
+  createdAt       DateTime @default(now())
+  updatedAt       DateTime @updatedAt
+
+  // Relations
+  product         Item     @relation(fields: [productId], references: [id])
+  items           BomItem[]
+  productionOrders ProductionOrder[]
+
+  @@unique([tenantId, productId, version])
+  @@index([tenantId])
+  @@map("bom_headers")
+}
+
+model BomItem {
+  id              String   @id @default(uuid()) @db.Uuid
+  bomId           String   @db.Uuid
+  itemId          String   @db.Uuid
+  quantity        Decimal  @db.Decimal(12, 3)
+  uom             String   @db.VarChar(20)
+  scrapPercentage Decimal? @db.Decimal(5, 2)
+  isOptional      Boolean  @default(false)
+  notes           String?
+  createdAt       DateTime @default(now())
+
+  // Relations
+  bom             BomHeader @relation(fields: [bomId], references: [id], onDelete: Cascade)
+  item            Item     @relation(fields: [itemId], references: [id])
+
+  @@index([bomId])
+  @@map("bom_items")
+}
+
+model ProductionOrder {
+  id              String   @id @default(uuid()) @db.Uuid
+  tenantId        String   @db.Uuid
+  plantId         String   @db.Uuid
+  poNumber        String   @db.VarChar(50)
+  bomId           String   @db.Uuid
+  productId       String   @db.Uuid
+  productUid      String?  @db.VarChar(30)
+  quantity        Decimal  @db.Decimal(12, 3)
+  uom             String   @db.VarChar(20)
+  scheduledStart  DateTime
+  scheduledEnd    DateTime
+  actualStart     DateTime?
+  actualEnd       DateTime?
+  status          ProductionStatus @default(PLANNED)
+  priority        Priority @default(MEDIUM)
+  notes           String?
+  metadata        Json     @default("{}")
+  createdAt       DateTime @default(now())
+  updatedAt       DateTime @updatedAt
+
+  // Relations
+  bom             BomHeader @relation(fields: [bomId], references: [id])
+  stages          ProductionStage[]
+  approvals       WorkflowApproval[]
+
+  @@unique([tenantId, poNumber])
+  @@index([tenantId, plantId])
+  @@index([status])
+  @@map("production_orders")
+}
+
+model ProductionStage {
+  id              String   @id @default(uuid()) @db.Uuid
+  productionOrderId String @db.Uuid
+  stageNumber     Int
+  stageName       String   @db.VarChar(100)
+  workstation     String?  @db.VarChar(100) // Workstation identifier
+  status          StageStatus @default(PENDING)
+  startedAt       DateTime?
+  completedAt     DateTime?
+  assignedTo      String?  @db.Uuid
+  
+  // Assembly Tracking - Which parts go in, what comes out
+  inputUids       Json     @default("[]") // UIDs of parts going into this stage
+  outputUid       String?  @db.VarChar(30) // UID of assembled part from this stage
+  
+  notes           String?
+  metadata        Json     @default("{}")
+  createdAt       DateTime @default(now())
+
+  // Relations
+  productionOrder ProductionOrder @relation(fields: [productionOrderId], references: [id], onDelete: Cascade)
+  qualityChecks   QualityCheck[]
+
+  @@index([productionOrderId])
+  @@index([outputUid])
+  @@map("production_stages")
+}
+
+enum ProductionStatus {
+  PLANNED
+  MATERIAL_ISSUED
+  IN_PROGRESS
+  QC_PENDING
+  COMPLETED
+  ON_HOLD
+  CANCELLED
+}
+
+enum StageStatus {
+  PENDING
+  IN_PROGRESS
+  COMPLETED
+  FAILED
+  SKIPPED
+}
+
+// ============================================================================
+// QUALITY MODULE
+// ============================================================================
+
+model QualityCheck {
+  id              String   @id @default(uuid()) @db.Uuid
+  tenantId        String   @db.Uuid
+  plantId         String   @db.Uuid
+  checkType       QualityCheckType
+  referenceType   String   @db.VarChar(50) // GRN, Production, etc.
+  referenceId     String   @db.Uuid
+  inspectedBy     String   @db.Uuid
+  inspectionDate  DateTime @default(now())
+  result          QualityResult
+  defectCount     Int?     @default(0)
+  notes           String?
+  attachments     Json     @default("[]")
+  metadata        Json     @default("{}")
+  createdAt       DateTime @default(now())
+
+  // Relations
+  productionStage ProductionStage? @relation(fields: [referenceId], references: [id])
+
+  @@index([tenantId, plantId])
+  @@index([referenceType, referenceId])
+  @@map("quality_checks")
+}
+
+enum QualityCheckType {
+  INCOMING
+  IN_PROCESS
+  FINAL
+  RANDOM
+}
+
+enum QualityResult {
+  PASSED
+  FAILED
+  CONDITIONAL
+  PENDING
+}
+
+// ============================================================================
+// SALES MODULE
+// ============================================================================
+
+model SalesOrder {
+  id              String   @id @default(uuid()) @db.Uuid
+  tenantId        String   @db.Uuid
+  plantId         String   @db.Uuid
+  soNumber        String   @db.VarChar(50)
+  customerId      String   @db.Uuid
+  orderDate       DateTime @default(now())
+  deliveryDate    DateTime
+  status          SoStatus @default(DRAFT)
+  totalAmount     Decimal  @db.Decimal(15, 2)
+  taxAmount       Decimal  @db.Decimal(15, 2)
+  grandTotal      Decimal  @db.Decimal(15, 2)
+  currency        String   @default("INR") @db.VarChar(10)
+  paymentTerms    String?  @db.VarChar(100)
+  notes           String?
+  tallyPushed     Boolean  @default(false)
+  tallyRef        String?
+  metadata        Json     @default("{}")
+  createdAt       DateTime @default(now())
+  updatedAt       DateTime @updatedAt
+
+  // Relations
+  customer        Customer @relation(fields: [customerId], references: [id])
+  items           SalesOrderItem[]
+  warranties      WarrantyRecord[]
+  approvals       WorkflowApproval[]
+
+  @@unique([tenantId, soNumber])
+  @@index([tenantId, plantId])
+  @@index([customerId])
+  @@index([status])
+  @@map("sales_orders")
+}
+
+model SalesOrderItem {
+  id              String   @id @default(uuid()) @db.Uuid
+  soId            String   @db.Uuid
+  itemId          String   @db.Uuid
+  uid             String?  @db.VarChar(30)
+  quantity        Decimal  @db.Decimal(12, 3)
+  uom             String   @db.VarChar(20)
+  unitPrice       Decimal  @db.Decimal(15, 2)
+  taxRate         Decimal  @db.Decimal(5, 2)
+  discount        Decimal? @db.Decimal(5, 2)
+  totalAmount     Decimal  @db.Decimal(15, 2)
+  warrantyMonths  Int?     @default(0)
+  deliveredQty    Decimal  @default(0) @db.Decimal(12, 3)
+  notes           String?
+  createdAt       DateTime @default(now())
+
+  // Relations
+  so              SalesOrder @relation(fields: [soId], references: [id], onDelete: Cascade)
+
+  @@index([soId])
+  @@index([uid])
+  @@map("sales_order_items")
+}
+
+model WarrantyRecord {
+  id              String   @id @default(uuid()) @db.Uuid
+  tenantId        String   @db.Uuid
+  salesOrderId    String   @db.Uuid
+  productUid      String   @db.VarChar(30)
+  customerId      String   @db.Uuid
+  warrantyStartDate DateTime
+  warrantyEndDate DateTime
+  warrantyMonths  Int
+  coveredComponents Json    @default("[]")
+  terms           String?
+  status          WarrantyStatus @default(ACTIVE)
+  metadata        Json     @default("{}")
+  createdAt       DateTime @default(now())
+  updatedAt       DateTime @updatedAt
+
+  // Relations
+  salesOrder      SalesOrder @relation(fields: [salesOrderId], references: [id])
+  serviceTickets  ServiceTicket[]
+
+  @@unique([productUid])
+  @@index([tenantId])
+  @@index([customerId])
+  @@index([warrantyEndDate])
+  @@map("warranty_records")
+}
+
+enum WarrantyStatus {
+  ACTIVE
+  EXPIRED
+  VOID
+}
+
+// ============================================================================
+// AFTER-SALES SERVICE MODULE
+// ============================================================================
+
+model ServiceTicket {
+  id              String   @id @default(uuid()) @db.Uuid
+  tenantId        String   @db.Uuid
+  plantId         String   @db.Uuid
+  ticketNumber    String   @db.VarChar(50)
+  customerId      String   @db.Uuid
+  productUid      String?  @db.VarChar(30)
+  warrantyId      String?  @db.Uuid
+  issueType       String   @db.VarChar(100)
+  priority        Priority @default(MEDIUM)
+  description     String
+  status          TicketStatus @default(OPEN)
+  isUnderWarranty Boolean  @default(false)
+  assignedTo      String?  @db.Uuid
+  estimatedCost   Decimal? @db.Decimal(15, 2)
+  actualCost      Decimal? @db.Decimal(15, 2)
+  reportedDate    DateTime @default(now())
+  closedDate      DateTime?
+  notes           String?
+  metadata        Json     @default("{}")
+  createdAt       DateTime @default(now())
+  updatedAt       DateTime @updatedAt
+
+  // Relations
+  customer        Customer @relation(fields: [customerId], references: [id])
+  warranty        WarrantyRecord? @relation(fields: [warrantyId], references: [id])
+  activities      ServiceActivity[]
+  sparesParts     ServiceSparePart[]
+
+  @@unique([tenantId, ticketNumber])
+  @@index([tenantId, plantId])
+  @@index([customerId])
+  @@index([productUid])
+  @@index([status])
+  @@map("service_tickets")
+}
+
+model ServiceActivity {
+  id              String   @id @default(uuid()) @db.Uuid
+  ticketId        String   @db.Uuid
+  activityType    String   @db.VarChar(50)
+  description     String
+  performedBy     String   @db.Uuid
+  performedAt     DateTime @default(now())
+  duration        Int?     // in minutes
+  notes           String?
+  attachments     Json     @default("[]")
+  createdAt       DateTime @default(now())
+
+  // Relations
+  ticket          ServiceTicket @relation(fields: [ticketId], references: [id], onDelete: Cascade)
+
+  @@index([ticketId])
+  @@map("service_activities")
+}
+
+model ServiceSparePart {
+  id              String   @id @default(uuid()) @db.Uuid
+  ticketId        String   @db.Uuid
+  itemId          String   @db.Uuid
+  uid             String?  @db.VarChar(30)
+  quantity        Decimal  @db.Decimal(12, 3)
+  uom             String   @db.VarChar(20)
+  unitPrice       Decimal? @db.Decimal(15, 2)
+  isChargeable    Boolean  @default(false)
+  replacedAt      DateTime @default(now())
+  createdAt       DateTime @default(now())
+
+  // Relations
+  ticket          ServiceTicket @relation(fields: [ticketId], references: [id], onDelete: Cascade)
+
+  @@index([ticketId])
+  @@map("service_spare_parts")
+}
+
+enum TicketStatus {
+  OPEN
+  ASSIGNED
+  IN_PROGRESS
+  PENDING_PARTS
+  RESOLVED
+  CLOSED
+  CANCELLED
+}
+
+// ============================================================================
+// WORKFLOW & APPROVAL ENGINE
+// ============================================================================
+
+model WorkflowDefinition {
+  id              String   @id @default(uuid()) @db.Uuid
+  tenantId        String?  @db.Uuid // null = system workflow
+  code            String   @db.VarChar(50)
+  name            String   @db.VarChar(200)
+  entityType      String   @db.VarChar(50)
+  stages          Json     // Array of workflow stages
+  escalationRules Json?
+  isActive        Boolean  @default(true)
+  metadata        Json     @default("{}")
+  createdAt       DateTime @default(now())
+  updatedAt       DateTime @updatedAt
+
+  @@unique([tenantId, code])
+  @@index([tenantId])
+  @@map("workflow_definitions")
+}
+
+model WorkflowApproval {
+  id              String   @id @default(uuid()) @db.Uuid
+  tenantId        String   @db.Uuid
+  entityType      String   @db.VarChar(50)
+  entityId        String   @db.Uuid
+  stage           Int
+  stageName       String   @db.VarChar(100)
+  approverId      String   @db.Uuid
+  status          ApprovalStatus @default(PENDING)
+  action          String?  @db.VarChar(50)
+  comments        String?
+  actionedAt      DateTime?
+  dueDate         DateTime?
+  escalatedTo     String?  @db.Uuid
+  metadata        Json     @default("{}")
+  createdAt       DateTime @default(now())
+
+  // Polymorphic relations
+  purchaseRequisition PurchaseRequisition? @relation(fields: [entityId], references: [id], onDelete: Cascade, map: "workflow_pr_fkey")
+  purchaseOrder       PurchaseOrder? @relation(fields: [entityId], references: [id], onDelete: Cascade, map: "workflow_po_fkey")
+  productionOrder     ProductionOrder? @relation(fields: [entityId], references: [id], onDelete: Cascade, map: "workflow_prod_fkey")
+  salesOrder          SalesOrder? @relation(fields: [entityId], references: [id], onDelete: Cascade, map: "workflow_so_fkey")
+
+  @@index([tenantId])
+  @@index([entityType, entityId])
+  @@index([approverId])
+  @@index([status])
+  @@map("workflow_approvals")
+}
+
+enum ApprovalStatus {
+  PENDING
+  APPROVED
+  REJECTED
+  SENT_BACK
+  ESCALATED
+}
+
+// ============================================================================
+// HR MODULE - ATTENDANCE WITH GEO-TAGGING
+// ============================================================================
+
+model Attendance {
+  id              String   @id @default(uuid()) @db.Uuid
+  tenantId        String   @db.Uuid
+  employeeId      String   @db.Uuid
+  userId          String   @db.Uuid
+  attendanceDate  DateTime @default(now())
+  
+  // Check-in details
+  checkInTime     DateTime?
+  checkInLat      Decimal? @db.Decimal(10, 8)
+  checkInLng      Decimal? @db.Decimal(11, 8)
+  checkInLocation String?  @db.VarChar(255)
+  checkInPhotoUrl String?  @db.VarChar(500)
+  checkInNotes    String?
+  
+  // Check-out details
+  checkOutTime    DateTime?
+  checkOutLat     Decimal? @db.Decimal(10, 8)
+  checkOutLng     Decimal? @db.Decimal(11, 8)
+  checkOutLocation String? @db.VarChar(255)
+  checkOutPhotoUrl String? @db.VarChar(500)
+  checkOutNotes   String?
+  
+  // Status tracking
+  status          AttendanceStatus @default(ABSENT)
+  workHours       Decimal? @db.Decimal(5, 2)
+  isOutsideZone   Boolean  @default(false)
+  outsideZoneReason String?
+  
+  // Metadata
+  metadata        Json     @default("{}")
+  createdAt       DateTime @default(now())
+  updatedAt       DateTime @updatedAt
+  
+  // Relations
+  user            User     @relation(fields: [userId], references: [id])
+  
+  @@unique([tenantId, employeeId, attendanceDate])
+  @@index([tenantId, attendanceDate])
+  @@index([userId])
+  @@index([status])
+  @@map("attendance")
+}
+
+enum AttendanceStatus {
+  PRESENT
+  ABSENT
+  LATE
+  HALF_DAY
+  ON_LEAVE
+  WORK_FROM_HOME
+}
+
+// ============================================================================
+// AUDIT & LOGGING
+// ============================================================================
+
+model AuditLog {
+  id          String   @id @default(uuid()) @db.Uuid
+  tenantId    String   @db.Uuid
+  userId      String   @db.Uuid
+  action      String   @db.VarChar(50)
+  entityType  String   @db.VarChar(50)
+  entityId    String?  @db.Uuid
+  oldValues   Json?
+  newValues   Json?
+  ipAddress   String?  @db.VarChar(45)
+  userAgent   String?
+  timestamp   DateTime @default(now())
+
+  // Relations
+  user        User     @relation(fields: [userId], references: [id])
+
+  @@index([tenantId])
+  @@index([userId])
+  @@index([entityType, entityId])
+  @@index([timestamp])
+  @@map("audit_logs")
+}
+
+model Subscription {
+  id          String   @id @default(uuid()) @db.Uuid
+  tenantId    String   @db.Uuid
+  plan        String   @db.VarChar(50)
+  status      SubscriptionStatus @default(TRIAL)
+  startDate   DateTime
+  endDate     DateTime?
+  maxUsers    Int
+  maxPlants   Int
+  features    Json     @default("[]")
+  metadata    Json     @default("{}")
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+
+  // Relations
+  tenant      Tenant   @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+
+  @@index([tenantId])
+  @@map("subscriptions")
+}
+
+enum SubscriptionStatus {
+  TRIAL
+  ACTIVE
+  SUSPENDED
+  CANCELLED
+  EXPIRED
+}
+
+// ============================================================================
+// COMMON ENUMS
+// ============================================================================
+
+enum Status {
+  ACTIVE
+  INACTIVE
+}
+
+enum Priority {
+  LOW
+  MEDIUM
+  HIGH
+  CRITICAL
+}
+
+enum WorkflowStatus {
+  DRAFT
+  PENDING_APPROVAL
+  APPROVED
+  REJECTED
+  COMPLETED
+  CANCELLED
+}
+
+enum PoStatus {
+  DRAFT
+  PENDING_APPROVAL
+  APPROVED
+  SENT
+  PARTIALLY_RECEIVED
+  RECEIVED
+  CLOSED
+  CANCELLED
+}
+
+enum SoStatus {
+  DRAFT
+  PENDING_APPROVAL
+  APPROVED
+  IN_PRODUCTION
+  READY_TO_SHIP
+  PARTIALLY_SHIPPED
+  SHIPPED
+  DELIVERED
+  CLOSED
+  CANCELLED
+}
+
+enum InspectionStatus {
+  PENDING
+  IN_PROGRESS
+  PASSED
+  FAILED
+  CONDITIONAL
+}

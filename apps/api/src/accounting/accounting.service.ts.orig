@@ -1,0 +1,1489 @@
+import { BadRequestException, Injectable, NotFoundException } from '@nestjs/common';
+import { ConfigService } from '@nestjs/config';
+import { createClient, SupabaseClient } from '@supabase/supabase-js';
+import { mkdir, writeFile } from 'fs/promises';
+import { extname, join, resolve } from 'path';
+import { randomUUID } from 'crypto';
+
+@Injectable()
+export class AccountingService {
+  private readonly supabase: SupabaseClient;
+  constructor(private readonly config: ConfigService) {
+    this.supabase = createClient(config.get<string>('SUPABASE_URL') || process.env.SUPABASE_URL!, config.get<string>('SUPABASE_KEY') || process.env.SUPABASE_KEY!);
+  }
+
+  private actorId(actor: any): string {
+    return typeof actor === 'string' ? actor : String(actor?.id || '');
+  }
+
+  private isFinanceOverride(actor: any): boolean {
+    if (!actor || typeof actor === 'string') return false;
+    const roles = [actor.role, ...(Array.isArray(actor.roles) ? actor.roles : [])]
+      .map((role: any) => String(typeof role === 'string' ? role : role?.name || role?.code || '').toUpperCase());
+    return roles.some((role: string) => ['SUPER_ADMIN', 'SUPERADMIN', 'ADMINISTRATOR'].includes(role));
+  }
+
+  private async recordWorkflowEvent(tenantId: string, journalId: string, eventType: string, fromStatus: string | null, toStatus: string, performedBy: string, note?: any) {
+    const { error } = await this.supabase.from('accounting_journal_workflow_events').insert({
+      tenant_id: tenantId, journal_id: journalId, event_type: eventType, from_status: fromStatus,
+      to_status: toStatus, note: String(note || '').trim() || null, performed_by: performedBy || null,
+    });
+    if (error) throw new BadRequestException(`Journal workflow audit could not be recorded: ${error.message}`);
+  }
+
+  private async assertWorkflowAssignment(tenantId: string, actor: any, workflowRole: string) {
+    if (this.isFinanceOverride(actor) || typeof actor === 'string') return;
+    const { data, error } = await this.supabase.from('accounting_workflow_role_assignments').select('user_id').eq('tenant_id', tenantId).eq('workflow_role', workflowRole).eq('is_active', true);
+    if (error) throw new BadRequestException(`Finance workflow role check failed: ${error.message}`);
+    if ((data || []).length && !(data || []).some((row: any) => row.user_id === this.actorId(actor))) {
+      throw new BadRequestException(`You are not assigned as ${workflowRole.replaceAll('_', ' ').toLowerCase()} for this company.`);
+    }
+  }
+
+  async listWorkflowRoleAssignments(tenantId: string) {
+    const { data, error } = await this.supabase.from('accounting_workflow_role_assignments').select('*').eq('tenant_id', tenantId).order('workflow_role').order('created_at');
+    if (error) throw new BadRequestException(error.message);
+    return data || [];
+  }
+
+  async listWorkflowUsers(tenantId: string) {
+    const { data, error } = await this.supabase
+      .from('users')
+      .select('id,first_name,last_name,email,is_active')
+      .eq('tenant_id', tenantId)
+      .order('first_name')
+      .order('last_name');
+    if (error) throw new BadRequestException(error.message);
+    return (data || []).filter((row: any) => row.is_active !== false);
+  }
+
+  async setWorkflowRoleAssignment(tenantId: string, actor: any, body: any) {
+    if (!this.isFinanceOverride(actor)) throw new BadRequestException('Only a Finance Administrator can configure accounting workflow roles.');
+    const workflowRole = String(body.workflow_role || '').trim().toUpperCase();
+    const userId = String(body.user_id || '').trim();
+    const permitted = ['JOURNAL_PREPARER','JOURNAL_REVIEWER','JOURNAL_APPROVER','JOURNAL_POSTER','PAYMENT_PREPARER','PAYMENT_APPROVER','PAYMENT_POSTER'];
+    if (!userId || !permitted.includes(workflowRole)) throw new BadRequestException('Select a user and a valid finance workflow role.');
+    const { data, error } = await this.supabase.from('accounting_workflow_role_assignments').upsert({ tenant_id: tenantId, user_id: userId, workflow_role: workflowRole, is_active: body.is_active !== false, assigned_by: this.actorId(actor), updated_at: new Date().toISOString() }, { onConflict: 'tenant_id,user_id,workflow_role' }).select().single();
+    if (error || !data) throw new BadRequestException(error?.message || 'Workflow role could not be saved.');
+    return data;
+  }
+
+  /** A voucher is only allowed into an explicitly opened accounting period. */
+  private async assertOpenAccountingPeriod(tenantId: string, rawDate: any) {
+    const journalDate = String(rawDate || '').slice(0, 10);
+    if (!journalDate) throw new BadRequestException('Journal date is required.');
+    const { data: period, error } = await this.supabase
+      .from('accounting_periods')
+      .select('id, period_name, status')
+      .eq('tenant_id', tenantId)
+      .lte('start_date', journalDate)
+      .gte('end_date', journalDate)
+      .maybeSingle();
+    if (error) throw new BadRequestException(error.message);
+    if (!period) throw new BadRequestException(`No accounting period is configured for ${journalDate}. Create and open a period before posting.`);
+    if (period.status !== 'OPEN') throw new BadRequestException(`Accounting period ${period.period_name} is ${String(period.status).toLowerCase()}; entries cannot be posted there.`);
+    return period;
+  }
+
+  private async assertActiveJournalAccounts(tenantId: string, lines: any[]) {
+    const accountIds = [...new Set(lines.map((line) => String(line.account_id || '')).filter(Boolean))];
+    const { data: accounts, error } = await this.supabase
+      .from('accounting_accounts')
+      .select('id, account_code, account_name, is_active')
+      .eq('tenant_id', tenantId)
+      .in('id', accountIds);
+    if (error) throw new BadRequestException(error.message);
+    if ((accounts || []).length !== accountIds.length) throw new BadRequestException('Every journal line must use a ledger account from this company.');
+    const inactive = (accounts || []).find((account: any) => !account.is_active);
+    if (inactive) throw new BadRequestException(`Ledger ${inactive.account_code} — ${inactive.account_name} is inactive and cannot be used in a journal.`);
+  }
+
+  async listCostCentres(tenantId: string, query: any = {}) {
+    let q = this.supabase.from('accounting_cost_centres').select('*').eq('tenant_id', tenantId).order('centre_code');
+    if (query.active === 'true' || query.active === 'false') q = q.eq('is_active', query.active === 'true');
+    const { data, error } = await q;
+    if (error) throw new BadRequestException(error.message);
+    return data || [];
+  }
+
+  async createCostCentre(tenantId: string, userId: string, body: any) {
+    const centreCode = String(body.centre_code || '').trim().toUpperCase();
+    const centreName = String(body.centre_name || '').trim();
+    const centreType = String(body.centre_type || 'COST_CENTER').trim().toUpperCase();
+    if (!centreCode || !centreName || !['COST_CENTER', 'PROJECT', 'DEPARTMENT', 'PROFIT_CENTER'].includes(centreType)) throw new BadRequestException('Code, name and a valid centre type are required.');
+    const { data, error } = await this.supabase.from('accounting_cost_centres').insert({ tenant_id: tenantId, centre_code: centreCode, centre_name: centreName, centre_type: centreType, parent_id: body.parent_id || null, created_by: userId }).select().single();
+    if (error || !data) throw new BadRequestException(error?.code === '23505' ? 'A cost-centre code already exists.' : error?.message || 'Cost centre could not be created.');
+    return data;
+  }
+
+  async updateCostCentre(tenantId: string, id: string, body: any) {
+    const payload: any = { updated_at: new Date().toISOString() };
+    if (body.centre_name !== undefined) payload.centre_name = String(body.centre_name || '').trim();
+    if (body.centre_type !== undefined) {
+      const type = String(body.centre_type || '').trim().toUpperCase();
+      if (!['COST_CENTER', 'PROJECT', 'DEPARTMENT', 'PROFIT_CENTER'].includes(type)) throw new BadRequestException('Enter a valid centre type.');
+      payload.centre_type = type;
+    }
+    if (body.parent_id !== undefined) payload.parent_id = body.parent_id || null;
+    if (body.is_active !== undefined) payload.is_active = Boolean(body.is_active);
+    if (payload.centre_name === '') throw new BadRequestException('Cost-centre name is required.');
+    const { data, error } = await this.supabase.from('accounting_cost_centres').update(payload).eq('tenant_id', tenantId).eq('id', id).select().maybeSingle();
+    if (error) throw new BadRequestException(error.message);
+    if (!data) throw new NotFoundException('Cost centre not found.');
+    return data;
+  }
+
+  async listPostingRules(tenantId: string) {
+    const { data, error } = await this.supabase
+      .from('accounting_posting_rules')
+      .select('*')
+      .eq('tenant_id', tenantId)
+      .order('source_type')
+      .order('rule_code');
+    if (error) throw new BadRequestException(error.message);
+    return data || [];
+  }
+
+  async listExchangeRates(tenantId: string, query: any = {}) {
+    let request = this.supabase
+      .from('accounting_exchange_rates')
+      .select('*')
+      .eq('tenant_id', tenantId)
+      .order('rate_date', { ascending: false })
+      .order('from_currency_code');
+    if (query.active === 'true' || query.active === 'false') request = request.eq('is_active', query.active === 'true');
+    const { data, error } = await request;
+    if (error) throw new BadRequestException(error.message);
+    return data || [];
+  }
+
+  async createExchangeRate(tenantId: string, userId: string, body: any) {
+    const rateDate = String(body.rate_date || '').slice(0, 10);
+    const from = String(body.from_currency_code || '').trim().toUpperCase();
+    const to = String(body.to_currency_code || 'INR').trim().toUpperCase();
+    const rate = Number(body.exchange_rate || 0);
+    if (!rateDate || !/^[A-Z]{3}$/.test(from) || !/^[A-Z]{3}$/.test(to) || from === to || !Number.isFinite(rate) || rate <= 0) {
+      throw new BadRequestException('Enter a date, different three-letter currencies, and a positive exchange rate.');
+    }
+    const { data, error } = await this.supabase.from('accounting_exchange_rates').upsert({
+      tenant_id: tenantId, rate_date: rateDate, from_currency_code: from, to_currency_code: to,
+      exchange_rate: rate, source_reference: String(body.source_reference || '').trim() || null,
+      is_active: body.is_active !== false, created_by: userId, updated_at: new Date().toISOString(),
+    }, { onConflict: 'tenant_id,rate_date,from_currency_code,to_currency_code' }).select().single();
+    if (error || !data) throw new BadRequestException(error?.message || 'Exchange rate could not be saved.');
+    return data;
+  }
+
+  async updateExchangeRate(tenantId: string, id: string, body: any) {
+    const payload: any = { updated_at: new Date().toISOString() };
+    if (body.exchange_rate !== undefined) {
+      const rate = Number(body.exchange_rate);
+      if (!Number.isFinite(rate) || rate <= 0) throw new BadRequestException('Exchange rate must be greater than zero.');
+      payload.exchange_rate = rate;
+    }
+    if (body.source_reference !== undefined) payload.source_reference = String(body.source_reference || '').trim() || null;
+    if (body.is_active !== undefined) payload.is_active = Boolean(body.is_active);
+    const { data, error } = await this.supabase.from('accounting_exchange_rates').update(payload).eq('tenant_id', tenantId).eq('id', id).select().maybeSingle();
+    if (error) throw new BadRequestException(error.message);
+    if (!data) throw new NotFoundException('Exchange rate not found.');
+    return data;
+  }
+
+  async listRecurringJournals(tenantId: string) {
+    const { data, error } = await this.supabase.from('accounting_recurring_journals').select('*').eq('tenant_id', tenantId).order('next_run_date').order('template_code');
+    if (error) throw new BadRequestException(error.message);
+    return data || [];
+  }
+
+  private validateRecurringLines(lines: any[]) {
+    if (!Array.isArray(lines) || lines.length < 2) throw new BadRequestException('A recurring journal needs at least two lines.');
+    let debit = 0; let credit = 0;
+    for (const line of lines) {
+      const lineDebit = Number(line.debit || 0); const lineCredit = Number(line.credit || 0);
+      if (!line.account_id || lineDebit < 0 || lineCredit < 0 || (lineDebit <= 0 && lineCredit <= 0) || (lineDebit > 0 && lineCredit > 0)) throw new BadRequestException('Each template line needs an account and either a positive debit or positive credit.');
+      debit += lineDebit; credit += lineCredit;
+    }
+    if (Math.round(debit * 100) !== Math.round(credit * 100) || debit <= 0) throw new BadRequestException('Recurring journal debits and credits must balance and be greater than zero.');
+  }
+
+  async createRecurringJournal(tenantId: string, userId: string, body: any) {
+    const code = String(body.template_code || '').trim().toUpperCase();
+    const name = String(body.template_name || '').trim();
+    const frequency = String(body.frequency || 'MONTHLY').toUpperCase();
+    const nextRunDate = String(body.next_run_date || '').slice(0, 10);
+    const currency = String(body.transaction_currency_code || 'INR').trim().toUpperCase();
+    const rate = Number(body.exchange_rate || 1);
+    const narration = String(body.narration || '').trim();
+    const lines = Array.isArray(body.lines) ? body.lines : [];
+    if (!code || !name || !nextRunDate || !narration || !['WEEKLY', 'MONTHLY', 'QUARTERLY', 'YEARLY'].includes(frequency) || !/^[A-Z]{3}$/.test(currency) || !Number.isFinite(rate) || rate <= 0) throw new BadRequestException('Template code, name, date, narration, frequency, currency, and rate are required.');
+    this.validateRecurringLines(lines); await this.assertActiveJournalAccounts(tenantId, lines);
+    const { data, error } = await this.supabase.from('accounting_recurring_journals').insert({ tenant_id: tenantId, template_code: code, template_name: name, frequency, next_run_date: nextRunDate, transaction_currency_code: currency, exchange_rate: rate, narration, lines, is_active: body.is_active !== false, created_by: userId }).select().single();
+    if (error || !data) throw new BadRequestException(error?.code === '23505' ? 'A recurring-journal template with this code already exists.' : error?.message || 'Recurring-journal template could not be created.');
+    return data;
+  }
+
+  async updateRecurringJournal(tenantId: string, id: string, body: any) {
+    const { data: current, error: currentError } = await this.supabase.from('accounting_recurring_journals').select('*').eq('tenant_id', tenantId).eq('id', id).maybeSingle();
+    if (currentError) throw new BadRequestException(currentError.message);
+    if (!current) throw new NotFoundException('Recurring-journal template not found.');
+    const lines = body.lines === undefined ? current.lines : body.lines;
+    if (body.lines !== undefined) { this.validateRecurringLines(lines); await this.assertActiveJournalAccounts(tenantId, lines); }
+    const payload: any = { updated_at: new Date().toISOString() };
+    ['template_name', 'narration'].forEach((key) => { if (body[key] !== undefined) payload[key] = String(body[key] || '').trim(); });
+    if (body.frequency !== undefined) { const frequency = String(body.frequency).toUpperCase(); if (!['WEEKLY','MONTHLY','QUARTERLY','YEARLY'].includes(frequency)) throw new BadRequestException('Enter a valid recurrence frequency.'); payload.frequency = frequency; }
+    if (body.next_run_date !== undefined) payload.next_run_date = String(body.next_run_date).slice(0, 10);
+    if (body.exchange_rate !== undefined) { const rate = Number(body.exchange_rate); if (!Number.isFinite(rate) || rate <= 0) throw new BadRequestException('Exchange rate must be greater than zero.'); payload.exchange_rate = rate; }
+    if (body.transaction_currency_code !== undefined) { const currency = String(body.transaction_currency_code).trim().toUpperCase(); if (!/^[A-Z]{3}$/.test(currency)) throw new BadRequestException('Use a three-letter currency code.'); payload.transaction_currency_code = currency; }
+    if (body.lines !== undefined) payload.lines = lines;
+    if (body.is_active !== undefined) payload.is_active = Boolean(body.is_active);
+    const { data, error } = await this.supabase.from('accounting_recurring_journals').update(payload).eq('tenant_id', tenantId).eq('id', id).select().maybeSingle();
+    if (error) throw new BadRequestException(error.message); if (!data) throw new NotFoundException('Recurring-journal template not found.'); return data;
+  }
+
+  async generateRecurringJournal(tenantId: string, userId: string, id: string, body: any) {
+    const { data: template, error } = await this.supabase.from('accounting_recurring_journals').select('*').eq('tenant_id', tenantId).eq('id', id).maybeSingle();
+    if (error) throw new BadRequestException(error.message); if (!template) throw new NotFoundException('Recurring-journal template not found.'); if (!template.is_active) throw new BadRequestException('Activate the recurring-journal template before generating a voucher.');
+    const journalDate = String(body.journal_date || template.next_run_date).slice(0, 10);
+    const journal = await this.createJournal(tenantId, userId, { journal_date: journalDate, narration: template.narration, source_type: `RECURRING:${template.template_code}`, transaction_currency_code: template.transaction_currency_code, exchange_rate: template.exchange_rate, lines: template.lines });
+    const next = new Date(`${template.next_run_date}T00:00:00Z`); const months = template.frequency === 'MONTHLY' ? 1 : template.frequency === 'QUARTERLY' ? 3 : template.frequency === 'YEARLY' ? 12 : 0;
+    if (months) next.setUTCMonth(next.getUTCMonth() + months); else next.setUTCDate(next.getUTCDate() + 7);
+    await this.supabase.from('accounting_recurring_journals').update({ next_run_date: next.toISOString().slice(0, 10), last_generated_at: new Date().toISOString(), updated_at: new Date().toISOString() }).eq('tenant_id', tenantId).eq('id', id);
+    return { journal, template_code: template.template_code, next_run_date: next.toISOString().slice(0, 10) };
+  }
+
+  async createPostingRule(tenantId: string, userId: string, body: any) {
+    const ruleCode = String(body.rule_code || '').trim().toUpperCase();
+    const ruleName = String(body.rule_name || '').trim();
+    const sourceType = String(body.source_type || '').trim().toUpperCase();
+    const allowedSources = ['SALES_INVOICE', 'SALES_RECEIPT', 'PURCHASE_INVOICE', 'SUPPLIER_PAYMENT', 'STOCK_RECEIPT', 'STOCK_ISSUE', 'STOCK_ADJUSTMENT', 'PAYROLL', 'PAYROLL_RUN', 'SERVICE_INVOICE', 'SUBCONTRACT_RECEIPT', 'GRN', 'MANUAL_ADJUSTMENT'];
+    if (!ruleCode || !ruleName || !allowedSources.includes(sourceType) || !body.debit_account_id || !body.credit_account_id) throw new BadRequestException('Rule code, name, source, debit account, and credit account are required.');
+    if (body.debit_account_id === body.credit_account_id) throw new BadRequestException('Debit and credit accounts must be different.');
+    const { data, error } = await this.supabase.from('accounting_posting_rules').insert({
+      tenant_id: tenantId, rule_code: ruleCode, rule_name: ruleName, source_type: sourceType,
+      debit_account_id: body.debit_account_id, credit_account_id: body.credit_account_id,
+      tax_account_id: body.tax_account_id || null, narration_template: String(body.narration_template || '').trim() || null,
+      is_active: Boolean(body.is_active), created_by: userId,
+    }).select().single();
+    if (error || !data) throw new BadRequestException(error?.code === '23505' ? 'A posting-rule code already exists.' : error?.message || 'Posting rule could not be created.');
+    return data;
+  }
+
+  async updatePostingRule(tenantId: string, id: string, body: any) {
+    const { data: existing, error: existingError } = await this.supabase
+      .from('accounting_posting_rules')
+      .select('id, rule_name, debit_account_id, credit_account_id')
+      .eq('tenant_id', tenantId)
+      .eq('id', id)
+      .maybeSingle();
+    if (existingError) throw new BadRequestException(existingError.message);
+    if (!existing) throw new NotFoundException('Posting rule not found.');
+    const payload: any = { updated_at: new Date().toISOString() };
+    if (body.rule_name !== undefined) payload.rule_name = String(body.rule_name || '').trim();
+    if (body.debit_account_id !== undefined) payload.debit_account_id = body.debit_account_id;
+    if (body.credit_account_id !== undefined) payload.credit_account_id = body.credit_account_id;
+    if (body.tax_account_id !== undefined) payload.tax_account_id = body.tax_account_id || null;
+    if (body.narration_template !== undefined) payload.narration_template = String(body.narration_template || '').trim() || null;
+    if (body.is_active !== undefined) payload.is_active = Boolean(body.is_active);
+    if (payload.rule_name !== undefined && !payload.rule_name) throw new BadRequestException('Rule name is required.');
+    const debitAccountId = payload.debit_account_id || existing.debit_account_id;
+    const creditAccountId = payload.credit_account_id || existing.credit_account_id;
+    if (debitAccountId === creditAccountId) throw new BadRequestException('Debit and credit accounts must be different.');
+    const { data, error } = await this.supabase.from('accounting_posting_rules').update(payload).eq('tenant_id', tenantId).eq('id', id).select().maybeSingle();
+    if (error) throw new BadRequestException(error.message);
+    return data;
+  }
+
+  async createPostingRuleDraft(tenantId: string, userId: string, id: string, body: any) {
+    const { data: rule, error } = await this.supabase.from('accounting_posting_rules').select('*').eq('tenant_id', tenantId).eq('id', id).maybeSingle();
+    if (error) throw new BadRequestException(error.message);
+    if (!rule) throw new NotFoundException('Posting rule not found.');
+    if (!rule.is_active) throw new BadRequestException('Activate and finance-review this posting rule before creating a draft voucher.');
+    const amount = Number(body.amount || 0);
+    const journalDate = String(body.journal_date || '').slice(0, 10);
+    if (!Number.isFinite(amount) || amount <= 0 || !journalDate) throw new BadRequestException('Enter a positive amount and journal date.');
+    const reference = String(body.reference_number || '').trim();
+    const narrationTemplate = String(rule.narration_template || rule.rule_name);
+    const narration = String(body.narration || '').trim() || narrationTemplate.replaceAll('{{document_number}}', reference || 'unreferenced document').replaceAll('{{amount}}', amount.toFixed(2));
+    const journal = await this.createJournal(tenantId, userId, {
+      journal_number: String(body.journal_number || `PRV-${Date.now()}`), journal_date: journalDate, source_type: rule.source_type, narration,
+      lines: [{ account_id: rule.debit_account_id, debit: amount, credit: 0, description: reference || rule.rule_name }, { account_id: rule.credit_account_id, debit: 0, credit: amount, description: reference || rule.rule_name }],
+    });
+    return { ...journal, posting_rule: { id: rule.id, rule_code: rule.rule_code, rule_name: rule.rule_name }, preview_only: true };
+  }
+
+  async createOperationalPosting(tenantId: string, actor: any, body: any) {
+    const userId = this.actorId(actor);
+    const sourceType = String(body.source_type || '').trim().toUpperCase();
+    const sourceId = String(body.source_id || '').trim();
+    const amount = Number(body.amount || 0);
+    const journalDate = String(body.journal_date || '').slice(0, 10);
+    if (!sourceType || !sourceId || !journalDate || !Number.isFinite(amount) || amount <= 0) throw new BadRequestException('Source type, source document id, date and a positive amount are required for operational posting.');
+    const { data: prior, error: priorError } = await this.supabase.from('accounting_source_postings').select('*, journal:accounting_journals(*)').eq('tenant_id', tenantId).eq('source_type', sourceType).eq('source_id', sourceId).maybeSingle();
+    if (priorError) throw new BadRequestException(priorError.message);
+    if (prior) return { ...prior, idempotent: true };
+    const { data: rule, error: ruleError } = await this.supabase.from('accounting_posting_rules').select('*').eq('tenant_id', tenantId).eq('source_type', sourceType).eq('is_active', true).order('created_at').limit(1).maybeSingle();
+    if (ruleError) throw new BadRequestException(ruleError.message);
+    if (!rule) throw new BadRequestException(`No active finance-approved posting rule is configured for ${sourceType.replaceAll('_', ' ')}.`);
+    const sourceNumber = String(body.source_number || body.reference_number || '').trim() || null;
+    const { data: created, error: createdError } = await this.supabase.from('accounting_source_postings').insert({ tenant_id: tenantId, source_type: sourceType, source_id: sourceId, source_number: sourceNumber, posting_rule_id: rule.id, amount, status: 'DRAFT_CREATED', created_by: userId }).select().single();
+    if (createdError || !created) throw new BadRequestException(createdError?.message || 'Operational posting register could not be created.');
+    try {
+      const narration = String(body.narration || '').trim() || String(rule.narration_template || rule.rule_name).replaceAll('{{document_number}}', sourceNumber || sourceId).replaceAll('{{amount}}', amount.toFixed(2));
+      const journal = await this.createJournal(tenantId, userId, { journal_number: String(body.journal_number || `AUTO-${Date.now()}`), journal_date: journalDate, source_type: sourceType, source_id: sourceId, narration, lines: [{ account_id: rule.debit_account_id, debit: amount, credit: 0, description: sourceNumber || rule.rule_name }, { account_id: rule.credit_account_id, debit: 0, credit: amount, description: sourceNumber || rule.rule_name }] });
+      await this.supabase.from('accounting_source_postings').update({ journal_id: journal.id, updated_at: new Date().toISOString() }).eq('tenant_id', tenantId).eq('id', created.id);
+      return { ...created, journal, idempotent: false };
+    } catch (failure: any) {
+      await this.supabase.from('accounting_source_postings').update({ status: 'FAILED', error_message: String(failure?.message || 'Journal draft failed'), updated_at: new Date().toISOString() }).eq('tenant_id', tenantId).eq('id', created.id);
+      throw failure;
+    }
+  }
+
+  async listAccounts(tenantId: string, query: any = {}) {
+    let q = this.supabase.from('accounting_accounts').select('*').eq('tenant_id', tenantId).order('account_code');
+    if (query.type) q = q.eq('account_type', String(query.type).toUpperCase());
+    if (query.active === 'true' || query.active === 'false') q = q.eq('is_active', query.active === 'true');
+    const { data, error } = await q;
+    if (error) throw new BadRequestException(error.message);
+    return data || [];
+  }
+
+  async createAccount(tenantId: string, userId: string, body: any) {
+    const code = String(body.account_code || '').trim().toUpperCase();
+    const name = String(body.account_name || '').trim();
+    const type = String(body.account_type || '').trim().toUpperCase();
+    if (!code || !name || !['ASSET','LIABILITY','EQUITY','REVENUE','EXPENSE'].includes(type)) throw new BadRequestException('Account code, name and valid account type are required.');
+    const openingDebit = Number(body.opening_debit || 0);
+    const openingCredit = Number(body.opening_credit || 0);
+    if (openingDebit < 0 || openingCredit < 0 || (openingDebit > 0 && openingCredit > 0)) throw new BadRequestException('Enter either an opening debit or an opening credit, not both.');
+    const { data, error } = await this.supabase.from('accounting_accounts').insert({ tenant_id: tenantId, account_code: code, account_name: name, account_type: type, account_subtype: body.account_subtype || null, parent_id: body.parent_id || null, is_control_account: Boolean(body.is_control_account), is_suspense_account: Boolean(body.is_suspense_account), currency_code: body.currency_code || 'INR', opening_debit: openingDebit, opening_credit: openingCredit, created_by: userId }).select().single();
+    if (error || !data) throw new BadRequestException(error?.code === '23505' ? 'Account code already exists.' : error?.message || 'Account could not be created');
+    return data;
+  }
+
+  async seedDefaultAccounts(tenantId: string, userId: string) {
+    const starterAccounts = [
+      ['1000', 'Cash and bank', 'ASSET', 'BANK', true, false],
+      ['1100', 'Trade receivables', 'ASSET', 'RECEIVABLE', true, false],
+      ['1200', 'Inventory', 'ASSET', 'INVENTORY', false, false],
+      ['1300', 'Input GST / VAT', 'ASSET', 'INPUT_TAX', false, false],
+      ['1400', 'Fixed assets', 'ASSET', 'FIXED_ASSET', false, false],
+      ['2000', 'Trade payables', 'LIABILITY', 'PAYABLE', true, false],
+      ['2100', 'Output GST / VAT', 'LIABILITY', 'OUTPUT_TAX', false, false],
+      ['2200', 'Accrued expenses', 'LIABILITY', 'ACCRUAL', false, false],
+      ['2300', 'Suspense account', 'LIABILITY', 'SUSPENSE', false, true],
+      ['3000', 'Capital account', 'EQUITY', 'CAPITAL', false, false],
+      ['3100', 'Retained earnings', 'EQUITY', 'RETAINED_EARNINGS', false, false],
+      ['4000', 'Sales revenue', 'REVENUE', 'GOODS_SALES', false, false],
+      ['4100', 'Service revenue', 'REVENUE', 'SERVICE_SALES', false, false],
+      ['5000', 'Cost of goods sold', 'EXPENSE', 'COGS', false, false],
+      ['5100', 'Purchase expense', 'EXPENSE', 'PURCHASE', false, false],
+      ['5200', 'Payroll expense', 'EXPENSE', 'PAYROLL', false, false],
+      ['5300', 'Depreciation expense', 'EXPENSE', 'DEPRECIATION', false, false],
+    ].map(([account_code, account_name, account_type, account_subtype, is_control_account, is_suspense_account]) => ({ tenant_id: tenantId, account_code, account_name, account_type, account_subtype, is_control_account, is_suspense_account, currency_code: 'INR', created_by: userId }));
+    const { data, error } = await this.supabase.from('accounting_accounts').upsert(starterAccounts, { onConflict: 'tenant_id,account_code', ignoreDuplicates: true }).select();
+    if (error) throw new BadRequestException(error.message);
+    return { created: data?.length || 0, message: data?.length ? 'Starter chart of accounts created.' : 'Starter chart of accounts was already present.' };
+  }
+
+  async updateAccount(tenantId: string, id: string, body: any) {
+    const payload: any = { updated_at: new Date().toISOString() };
+    if (body.account_name !== undefined) payload.account_name = String(body.account_name).trim();
+    if (body.parent_id !== undefined) payload.parent_id = body.parent_id || null;
+    if (body.is_active !== undefined) payload.is_active = Boolean(body.is_active);
+    if (body.account_subtype !== undefined) payload.account_subtype = body.account_subtype || null;
+    if (body.is_suspense_account !== undefined) payload.is_suspense_account = Boolean(body.is_suspense_account);
+    const { data, error } = await this.supabase.from('accounting_accounts').update(payload).eq('tenant_id', tenantId).eq('id', id).select().maybeSingle();
+    if (error) throw new BadRequestException(error.message);
+    if (!data) throw new NotFoundException('Account not found');
+    return data;
+  }
+
+  async listPeriods(tenantId: string) {
+    const { data, error } = await this.supabase.from('accounting_periods').select('*').eq('tenant_id', tenantId).order('start_date', { ascending: false });
+    if (error) throw new BadRequestException(error.message);
+    return data || [];
+  }
+
+  async createPeriod(tenantId: string, body: any) {
+    const periodName = String(body.period_name || '').trim();
+    const startDate = String(body.start_date || '').slice(0, 10);
+    const endDate = String(body.end_date || '').slice(0, 10);
+    if (!periodName || !startDate || !endDate || endDate < startDate) throw new BadRequestException('Period name and a valid start and end date are required.');
+    const { data, error } = await this.supabase.from('accounting_periods').insert({ tenant_id: tenantId, period_name: periodName, start_date: startDate, end_date: endDate }).select().single();
+    if (error || !data) throw new BadRequestException(error?.code === '23505' ? 'An accounting period with this name already exists.' : error?.message || 'Accounting period could not be created');
+    return data;
+  }
+
+  async periodCloseChecklist(tenantId: string, id: string) {
+    const { data: period, error: periodError } = await this.supabase.from('accounting_periods').select('*').eq('tenant_id', tenantId).eq('id', id).maybeSingle();
+    if (periodError) throw new BadRequestException(periodError.message);
+    if (!period) throw new NotFoundException('Accounting period not found');
+    const from = period.start_date;
+    const to = period.end_date;
+    const [draftsResult, unmatchedResult, openReceivablesResult, openPayablesResult, suspense] = await Promise.all([
+      this.supabase.from('accounting_journals').select('id', { count: 'exact', head: true }).eq('tenant_id', tenantId).in('status', ['DRAFT', 'REVIEWED', 'APPROVED']).gte('journal_date', from).lte('journal_date', to),
+      this.supabase.from('accounting_bank_transactions').select('id', { count: 'exact', head: true }).eq('tenant_id', tenantId).neq('reconciliation_status', 'MATCHED').gte('transaction_date', from).lte('transaction_date', to),
+      this.supabase.from('accounting_open_items').select('id', { count: 'exact', head: true }).eq('tenant_id', tenantId).eq('direction', 'RECEIVABLE').in('status', ['OPEN', 'PARTIAL']).lte('document_date', to),
+      this.supabase.from('accounting_open_items').select('id', { count: 'exact', head: true }).eq('tenant_id', tenantId).eq('direction', 'PAYABLE').in('status', ['OPEN', 'PARTIAL']).lte('document_date', to),
+      this.suspenseAccounts(tenantId, { as_of: to }),
+    ]);
+    for (const result of [draftsResult, unmatchedResult, openReceivablesResult, openPayablesResult]) if (result.error) throw new BadRequestException(result.error.message);
+    const suspenseBalance = (suspense || []).reduce((sum: number, account: any) => sum + Math.abs(Number(account.balance || 0)), 0);
+    const draftJournals = draftsResult.count || 0;
+    return {
+      period,
+      ready_to_close: period.status === 'OPEN' && draftJournals === 0,
+      checks: [
+        { code: 'UNPOSTED_JOURNALS', label: 'Unposted journals', count: draftJournals, blocking: true, status: draftJournals ? 'ACTION_REQUIRED' : 'CLEAR', detail: draftJournals ? 'Review, post, or remove every unposted voucher dated in this period.' : 'No unposted journals remain in this period.' },
+        { code: 'BANK_RECONCILIATION', label: 'Unmatched bank transactions', count: unmatchedResult.count || 0, blocking: false, status: unmatchedResult.count ? 'REVIEW' : 'CLEAR', detail: 'Review bank transactions dated in this period before final lock.' },
+        { code: 'SUSPENSE', label: 'Suspense balance', amount: suspenseBalance, blocking: false, status: suspenseBalance ? 'REVIEW' : 'CLEAR', detail: 'Resolve suspense balances before management reporting is signed off.' },
+        { code: 'OPEN_RECEIVABLES', label: 'Open customer items', count: openReceivablesResult.count || 0, blocking: false, status: openReceivablesResult.count ? 'REVIEW' : 'CLEAR', detail: 'Open receivables remain visible for collection follow-up.' },
+        { code: 'OPEN_PAYABLES', label: 'Open supplier items', count: openPayablesResult.count || 0, blocking: false, status: openPayablesResult.count ? 'REVIEW' : 'CLEAR', detail: 'Open payables remain visible for payment approval.' },
+      ],
+    };
+  }
+
+  async closePeriod(tenantId: string, id: string, userId: string) {
+    const { data: period, error: lookupError } = await this.supabase.from('accounting_periods').select('*').eq('tenant_id', tenantId).eq('id', id).maybeSingle();
+    if (lookupError) throw new BadRequestException(lookupError.message);
+    if (!period) throw new NotFoundException('Accounting period not found');
+    if (period.status !== 'OPEN') throw new BadRequestException('Only an open accounting period can be closed.');
+    const { count, error } = await this.supabase.from('accounting_journals').select('id', { count: 'exact', head: true }).eq('tenant_id', tenantId).in('status', ['DRAFT', 'REVIEWED', 'APPROVED']).gte('journal_date', period.start_date).lte('journal_date', period.end_date);
+    if (error) throw new BadRequestException(error.message);
+    if ((count || 0) > 0) throw new BadRequestException('Review, post, or cancel all unposted journals in this period before closing it.');
+    const { data, error: updateError } = await this.supabase.from('accounting_periods').update({ status: 'CLOSED', closed_at: new Date().toISOString(), closed_by: userId }).eq('tenant_id', tenantId).eq('id', id).eq('status', 'OPEN').select().single();
+    if (updateError || !data) throw new BadRequestException(updateError?.message || 'Period could not be closed');
+    return data;
+  }
+
+  async lockPeriod(tenantId: string, id: string, userId: string) {
+    const { data: period, error: lookupError } = await this.supabase.from('accounting_periods').select('*').eq('tenant_id', tenantId).eq('id', id).maybeSingle();
+    if (lookupError) throw new BadRequestException(lookupError.message);
+    if (!period) throw new NotFoundException('Accounting period not found');
+    if (period.status !== 'CLOSED') throw new BadRequestException('Only a closed accounting period can be locked.');
+    const { data, error } = await this.supabase.from('accounting_periods').update({ status: 'LOCKED', closed_at: period.closed_at || new Date().toISOString(), closed_by: period.closed_by || userId }).eq('tenant_id', tenantId).eq('id', id).eq('status', 'CLOSED').select().single();
+    if (error || !data) throw new BadRequestException(error?.message || 'Period could not be locked');
+    return data;
+  }
+
+  async listJournals(tenantId: string, query: any = {}) {
+    let q = this.supabase.from('accounting_journals').select('*, lines:accounting_journal_lines(*)').eq('tenant_id', tenantId).order('journal_date', { ascending: false }).order('created_at', { ascending: false });
+    if (query.status) q = q.eq('status', String(query.status).toUpperCase());
+    if (query.from) q = q.gte('journal_date', query.from);
+    if (query.to) q = q.lte('journal_date', query.to);
+    if (query.search) {
+      const term = String(query.search).trim().replace(/[,%()]/g, '');
+      if (term) q = q.or(`journal_number.ilike.%${term}%,narration.ilike.%${term}%,source_type.ilike.%${term}%`);
+    }
+    const { data, error } = await q;
+    if (error) throw new BadRequestException(error.message);
+    return data || [];
+  }
+
+  async createJournal(tenantId: string, actor: any, body: any) {
+    const userId = this.actorId(actor);
+    await this.assertWorkflowAssignment(tenantId, actor, 'JOURNAL_PREPARER');
+    const lines = Array.isArray(body.lines) ? body.lines : [];
+    if (lines.length < 2) throw new BadRequestException('A journal requires at least two lines.');
+    for (const line of lines) {
+      const debit = Number(line.debit || 0); const credit = Number(line.credit || 0);
+      if (!line.account_id || debit < 0 || credit < 0 || (debit <= 0 && credit <= 0) || (debit > 0 && credit > 0)) throw new BadRequestException('Each journal line needs an account and either a positive debit or a positive credit.');
+    }
+    const debit = lines.reduce((sum: number, line: any) => sum + Math.max(0, Number(line.debit || 0)), 0);
+    const credit = lines.reduce((sum: number, line: any) => sum + Math.max(0, Number(line.credit || 0)), 0);
+    if (Math.round(debit * 100) !== Math.round(credit * 100) || debit <= 0) throw new BadRequestException('Journal debits and credits must balance and be greater than zero.');
+    const date = String(body.journal_date || '').slice(0, 10);
+    if (!date || !body.narration) throw new BadRequestException('Journal date and narration are required.');
+    const transactionCurrency = String(body.transaction_currency_code || 'INR').trim().toUpperCase();
+    const exchangeRate = Number(body.exchange_rate || 1);
+    if (!/^[A-Z]{3}$/.test(transactionCurrency) || !Number.isFinite(exchangeRate) || exchangeRate <= 0) throw new BadRequestException('Enter a valid three-letter transaction currency and positive exchange rate.');
+    await this.assertActiveJournalAccounts(tenantId, lines);
+    const { data: journal, error } = await this.supabase.from('accounting_journals').insert({ tenant_id: tenantId, journal_number: String(body.journal_number || `JV-${Date.now()}`), journal_date: date, source_type: body.source_type || null, source_id: body.source_id || null, adjustment_type: body.adjustment_type || 'NONE', reversal_of_id: body.reversal_of_id || null, narration: String(body.narration).trim(), total_debit: debit.toFixed(2), total_credit: credit.toFixed(2), transaction_currency_code: transactionCurrency, exchange_rate: exchangeRate, foreign_total_debit: (debit / exchangeRate).toFixed(2), foreign_total_credit: (credit / exchangeRate).toFixed(2), created_by: userId }).select().single();
+    if (error || !journal) throw new BadRequestException(error?.message || 'Journal could not be created');
+    const lineRows = lines.map((line: any, index: number) => ({ tenant_id: tenantId, journal_id: journal.id, line_number: index + 1, account_id: line.account_id, description: line.description || null, debit: Number(line.debit || 0), credit: Number(line.credit || 0), foreign_debit: (Number(line.debit || 0) / exchangeRate).toFixed(2), foreign_credit: (Number(line.credit || 0) / exchangeRate).toFixed(2), party_type: line.party_type || null, party_id: line.party_id || null, cost_center: line.cost_center || null, tax_code: line.tax_code || null }));
+    const { error: lineError } = await this.supabase.from('accounting_journal_lines').insert(lineRows);
+    if (lineError) { await this.supabase.from('accounting_journals').delete().eq('tenant_id', tenantId).eq('id', journal.id); throw new BadRequestException(lineError.message); }
+    await this.recordWorkflowEvent(tenantId, journal.id, 'PREPARED', null, 'DRAFT', userId, 'Journal prepared');
+    return { ...journal, lines: lineRows };
+  }
+
+  async postJournal(tenantId: string, id: string, actor: any) {
+    const userId = this.actorId(actor);
+    await this.assertWorkflowAssignment(tenantId, actor, 'JOURNAL_POSTER');
+    const { data: journal, error } = await this.supabase.from('accounting_journals').select('*, lines:accounting_journal_lines(*)').eq('tenant_id', tenantId).eq('id', id).maybeSingle();
+    if (error) throw new BadRequestException(error.message);
+    if (!journal) throw new NotFoundException('Journal not found');
+    if (!['DRAFT', 'REVIEWED', 'APPROVED'].includes(journal.status)) throw new BadRequestException('Only draft, reviewed or approved journals can be posted.');
+    const manualOrRecurring = !journal.source_type || /^(MANUAL|RECURRING)/i.test(String(journal.source_type));
+    if (manualOrRecurring && journal.status !== 'APPROVED') {
+      throw new BadRequestException('This manual or recurring journal must be reviewed and approved before posting.');
+    }
+    if (manualOrRecurring && !this.isFinanceOverride(actor)) {
+      const { data: approval, error: approvalError } = await this.supabase.from('accounting_journal_approvals').select('approved_by,approval_status').eq('tenant_id', tenantId).eq('journal_id', id).maybeSingle();
+      const { data: review, error: reviewError } = await this.supabase.from('accounting_journal_reviews').select('reviewed_by').eq('tenant_id', tenantId).eq('journal_id', id).maybeSingle();
+      if (approvalError || reviewError || !approval || approval.approval_status !== 'APPROVED') throw new BadRequestException('A recorded approval is required before this journal can be posted.');
+      if ([journal.created_by, review?.reviewed_by, approval.approved_by].filter(Boolean).includes(userId)) throw new BadRequestException('Maker-checker control: the poster must be independent from the preparer, reviewer and approver.');
+    }
+    const debit = (journal.lines || []).reduce((sum: number, line: any) => sum + Number(line.debit || 0), 0);
+    const credit = (journal.lines || []).reduce((sum: number, line: any) => sum + Number(line.credit || 0), 0);
+    if ((journal.lines || []).length < 2 || Math.round(debit * 100) !== Math.round(credit * 100) || debit <= 0) throw new BadRequestException('The journal lines must contain a balanced, positive debit and credit before posting.');
+    await this.assertOpenAccountingPeriod(tenantId, journal.journal_date);
+    await this.assertActiveJournalAccounts(tenantId, journal.lines || []);
+    const { data, error: updateError } = await this.supabase.from('accounting_journals').update({ status: 'POSTED', posted_at: new Date().toISOString(), posted_by: userId, updated_at: new Date().toISOString() }).eq('tenant_id', tenantId).eq('id', id).eq('status', journal.status).select().single();
+    if (updateError || !data) throw new BadRequestException(updateError?.message || 'Journal could not be posted');
+    await this.recordWorkflowEvent(tenantId, id, 'POSTED', journal.status, 'POSTED', userId, 'Journal posted');
+    return { ...data, lines: journal.lines || [] };
+  }
+
+  async getJournal(tenantId: string, id: string) {
+    const { data, error } = await this.supabase.from('accounting_journals').select('*, lines:accounting_journal_lines(*)').eq('tenant_id', tenantId).eq('id', id).maybeSingle();
+    if (error) throw new BadRequestException(error.message);
+    if (!data) throw new NotFoundException('Journal not found');
+    const { data: attachments, error: attachmentError } = await this.supabase.from('accounting_journal_attachments').select('*').eq('tenant_id', tenantId).eq('journal_id', id).order('created_at', { ascending: false });
+    if (attachmentError) throw new BadRequestException(attachmentError.message);
+    const { data: review, error: reviewError } = await this.supabase.from('accounting_journal_reviews').select('*').eq('tenant_id', tenantId).eq('journal_id', id).maybeSingle();
+    if (reviewError) throw new BadRequestException(reviewError.message);
+    const { data: approval, error: approvalError } = await this.supabase.from('accounting_journal_approvals').select('*').eq('tenant_id', tenantId).eq('journal_id', id).maybeSingle();
+    if (approvalError) throw new BadRequestException(approvalError.message);
+    const { data: workflow, error: workflowError } = await this.supabase.from('accounting_journal_workflow_events').select('*').eq('tenant_id', tenantId).eq('journal_id', id).order('created_at', { ascending: false });
+    if (workflowError) throw new BadRequestException(workflowError.message);
+    return { ...data, lines: [...(data.lines || [])].sort((a: any, b: any) => Number(a.line_number) - Number(b.line_number)), attachments: attachments || [], review: review || null, approval: approval || null, workflow: workflow || [] };
+  }
+
+  async addJournalAttachment(tenantId: string, userId: string, journalId: string, file: Express.Multer.File, rawNote?: any) {
+    await this.getJournal(tenantId, journalId);
+    const allowedTypes = new Set(['application/pdf', 'image/png', 'image/jpeg', 'image/jpg', 'image/webp', 'text/plain', 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet', 'application/vnd.ms-excel']);
+    if (!file?.buffer || !allowedTypes.has(file.mimetype)) throw new BadRequestException('Supporting evidence must be a PDF, image, text file, or spreadsheet.');
+    if (Number(file.size || 0) > 25 * 1024 * 1024) throw new BadRequestException('Supporting evidence is too large (maximum 25 MB).');
+    const ext = extname(file.originalname || '').toLowerCase();
+    const safeExt = ext && ext.length <= 10 ? ext : file.mimetype === 'application/pdf' ? '.pdf' : file.mimetype.startsWith('image/') ? '.jpg' : '';
+    const relativeDir = `accounting/journals/${new Date().toISOString().slice(0, 10)}/${tenantId}/${journalId}`;
+    const root = this.config.get<string>('UPLOAD_ROOT_DIR') || resolve(process.cwd(), '..', '..', 'uploads');
+    await mkdir(join(root, relativeDir), { recursive: true });
+    const filename = `${randomUUID()}${safeExt}`;
+    await writeFile(join(root, relativeDir, filename), file.buffer);
+    const { data, error } = await this.supabase.from('accounting_journal_attachments').insert({ tenant_id: tenantId, journal_id: journalId, file_name: file.originalname || filename, file_url: `/uploads/${relativeDir}/${filename}`, mime_type: file.mimetype, file_size: Number(file.size || 0), note: String(rawNote || '').trim() || null, created_by: userId }).select().single();
+    if (error || !data) throw new BadRequestException(error?.message || 'Supporting evidence could not be recorded.');
+    return data;
+  }
+
+  async updateJournal(tenantId: string, id: string, body: any) {
+    const current = await this.getJournal(tenantId, id);
+    if (current.status !== 'DRAFT') throw new BadRequestException('Only draft journals can be edited. Posted journals must be reversed, never overwritten.');
+    const lines = Array.isArray(body.lines) ? body.lines : [];
+    if (lines.length < 2) throw new BadRequestException('A journal requires at least two lines.');
+    let debit = 0; let credit = 0;
+    for (const line of lines) {
+      const lineDebit = Number(line.debit || 0); const lineCredit = Number(line.credit || 0);
+      if (!line.account_id || lineDebit < 0 || lineCredit < 0 || (lineDebit <= 0 && lineCredit <= 0) || (lineDebit > 0 && lineCredit > 0)) throw new BadRequestException('Each journal line needs an account and either a positive debit or a positive credit.');
+      debit += lineDebit; credit += lineCredit;
+    }
+    if (Math.round(debit * 100) !== Math.round(credit * 100) || debit <= 0) throw new BadRequestException('Journal debits and credits must balance and be greater than zero.');
+    const journalDate = String(body.journal_date || current.journal_date).slice(0, 10);
+    const narration = String(body.narration || '').trim();
+    if (!journalDate || !narration) throw new BadRequestException('Journal date and narration are required.');
+    const transactionCurrency = String(body.transaction_currency_code || current.transaction_currency_code || 'INR').trim().toUpperCase();
+    const exchangeRate = Number(body.exchange_rate || current.exchange_rate || 1);
+    if (!/^[A-Z]{3}$/.test(transactionCurrency) || !Number.isFinite(exchangeRate) || exchangeRate <= 0) throw new BadRequestException('Enter a valid three-letter transaction currency and positive exchange rate.');
+    await this.assertActiveJournalAccounts(tenantId, lines);
+    const { error: deleteError } = await this.supabase.from('accounting_journal_lines').delete().eq('tenant_id', tenantId).eq('journal_id', id);
+    if (deleteError) throw new BadRequestException(deleteError.message);
+    const lineRows = lines.map((line: any, index: number) => ({ tenant_id: tenantId, journal_id: id, line_number: index + 1, account_id: line.account_id, description: line.description || null, debit: Number(line.debit || 0), credit: Number(line.credit || 0), foreign_debit: (Number(line.debit || 0) / exchangeRate).toFixed(2), foreign_credit: (Number(line.credit || 0) / exchangeRate).toFixed(2), party_type: line.party_type || null, party_id: line.party_id || null, cost_center: line.cost_center || null, tax_code: line.tax_code || null }));
+    const { error: lineError } = await this.supabase.from('accounting_journal_lines').insert(lineRows);
+    if (lineError) throw new BadRequestException(lineError.message);
+    const { data, error } = await this.supabase.from('accounting_journals').update({ journal_number: String(body.journal_number || current.journal_number).trim(), journal_date: journalDate, narration, source_type: body.source_type || null, adjustment_type: body.adjustment_type || 'NONE', total_debit: debit.toFixed(2), total_credit: credit.toFixed(2), transaction_currency_code: transactionCurrency, exchange_rate: exchangeRate, foreign_total_debit: (debit / exchangeRate).toFixed(2), foreign_total_credit: (credit / exchangeRate).toFixed(2), updated_at: new Date().toISOString() }).eq('tenant_id', tenantId).eq('id', id).eq('status', 'DRAFT').select().single();
+    if (error || !data) throw new BadRequestException(error?.message || 'Draft journal could not be updated.');
+    return { ...data, lines: lineRows };
+  }
+
+  async deleteJournal(tenantId: string, id: string) {
+    const current = await this.getJournal(tenantId, id);
+    if (current.status !== 'DRAFT') throw new BadRequestException('Only draft journals can be deleted. Posted journals must be reversed to preserve the audit trail.');
+    const { error } = await this.supabase.from('accounting_journals').delete().eq('tenant_id', tenantId).eq('id', id).eq('status', 'DRAFT');
+    if (error) throw new BadRequestException(error.message);
+    return { deleted: true, journal_number: current.journal_number };
+  }
+
+  async reviewJournal(tenantId: string, actor: any, id: string, body: any = {}) {
+    const userId = this.actorId(actor);
+    await this.assertWorkflowAssignment(tenantId, actor, 'JOURNAL_REVIEWER');
+    const journal = await this.getJournal(tenantId, id);
+    if (!['DRAFT', 'REVIEWED'].includes(journal.status)) throw new BadRequestException('Only draft or reviewed journals can be reviewed. Posted journals are already immutable.');
+    if (!this.isFinanceOverride(actor) && journal.created_by && journal.created_by === userId) {
+      throw new BadRequestException('Maker-checker control: the preparer cannot review their own journal. Use a different authorised finance user.');
+    }
+    const reviewStatus = String(body.review_status || 'APPROVED').toUpperCase();
+    if (!['APPROVED', 'RETURNED'].includes(reviewStatus)) throw new BadRequestException('Review status must be APPROVED or RETURNED.');
+    const nextStatus = reviewStatus === 'APPROVED' ? 'REVIEWED' : 'DRAFT';
+    const payload = { tenant_id: tenantId, journal_id: id, review_status: reviewStatus, review_note: String(body.review_note || '').trim() || null, reviewed_by: userId, reviewed_at: new Date().toISOString(), updated_at: new Date().toISOString() };
+    const { data, error } = await this.supabase.from('accounting_journal_reviews').upsert(payload, { onConflict: 'tenant_id,journal_id' }).select().single();
+    if (error || !data) throw new BadRequestException(error?.message || 'Journal review could not be saved.');
+    const { data: updated, error: journalError } = await this.supabase.from('accounting_journals').update({ status: nextStatus, updated_at: new Date().toISOString() }).eq('tenant_id', tenantId).eq('id', id).eq('status', journal.status).select().single();
+    if (journalError || !updated) throw new BadRequestException(journalError?.message || 'Journal review status could not be updated.');
+    await this.recordWorkflowEvent(tenantId, id, reviewStatus === 'APPROVED' ? 'REVIEWED' : 'RETURNED', journal.status, nextStatus, userId, payload.review_note);
+    return { journal_number: journal.journal_number, status: updated.status, review: data };
+  }
+
+  async approveJournal(tenantId: string, actor: any, id: string, body: any = {}) {
+    const userId = this.actorId(actor);
+    await this.assertWorkflowAssignment(tenantId, actor, 'JOURNAL_APPROVER');
+    const journal = await this.getJournal(tenantId, id);
+    if (journal.status !== 'REVIEWED') throw new BadRequestException('Only a reviewed journal can be approved.');
+    const review = journal.review;
+    if (!this.isFinanceOverride(actor) && [journal.created_by, review?.reviewed_by].filter(Boolean).includes(userId)) {
+      throw new BadRequestException('Maker-checker control: the approver must be independent from the preparer and reviewer.');
+    }
+    const approvalStatus = String(body.approval_status || 'APPROVED').toUpperCase();
+    if (!['APPROVED', 'RETURNED'].includes(approvalStatus)) throw new BadRequestException('Approval status must be APPROVED or RETURNED.');
+    const nextStatus = approvalStatus === 'APPROVED' ? 'APPROVED' : 'DRAFT';
+    const payload = { tenant_id: tenantId, journal_id: id, approval_status: approvalStatus, approval_note: String(body.approval_note || '').trim() || null, approved_by: userId, approved_at: new Date().toISOString(), updated_at: new Date().toISOString() };
+    const { data, error } = await this.supabase.from('accounting_journal_approvals').upsert(payload, { onConflict: 'tenant_id,journal_id' }).select().single();
+    if (error || !data) throw new BadRequestException(error?.message || 'Journal approval could not be saved.');
+    const { data: updated, error: journalError } = await this.supabase.from('accounting_journals').update({ status: nextStatus, updated_at: new Date().toISOString() }).eq('tenant_id', tenantId).eq('id', id).eq('status', 'REVIEWED').select().single();
+    if (journalError || !updated) throw new BadRequestException(journalError?.message || 'Journal approval status could not be updated.');
+    await this.recordWorkflowEvent(tenantId, id, approvalStatus === 'APPROVED' ? 'APPROVED' : 'RETURNED', 'REVIEWED', nextStatus, userId, payload.approval_note);
+    return { journal_number: journal.journal_number, status: updated.status, approval: data };
+  }
+
+  async trialBalance(tenantId: string, query: any = {}) {
+    const asOf = String(query.as_of || new Date().toISOString().slice(0, 10)).slice(0, 10);
+    const { data: accounts, error: accountError } = await this.supabase.from('accounting_accounts').select('*').eq('tenant_id', tenantId).order('account_code');
+    if (accountError) throw new BadRequestException(accountError.message);
+    const { data: lines, error: lineError } = await this.supabase.from('accounting_journal_lines').select('account_id, debit, credit, journal:accounting_journals!inner(journal_date,status)').eq('tenant_id', tenantId).eq('journal.status', 'POSTED').lte('journal.journal_date', asOf);
+    if (lineError) throw new BadRequestException(lineError.message);
+    const totals = new Map<string, { debit: number; credit: number }>();
+    for (const line of lines || []) { const t = totals.get(line.account_id) || { debit: 0, credit: 0 }; t.debit += Number(line.debit || 0); t.credit += Number(line.credit || 0); totals.set(line.account_id, t); }
+    return (accounts || []).map((account: any) => { const t = totals.get(account.id) || { debit: 0, credit: 0 }; return { ...account, debit: Number(account.opening_debit || 0) + t.debit, credit: Number(account.opening_credit || 0) + t.credit, balance: Number(account.opening_debit || 0) + t.debit - Number(account.opening_credit || 0) - t.credit }; });
+  }
+
+  async profitLoss(tenantId: string, query: any = {}) {
+    const rows = await this.trialBalance(tenantId, query);
+    const revenue = rows.filter((r: any) => r.account_type === 'REVENUE');
+    const expenses = rows.filter((r: any) => r.account_type === 'EXPENSE');
+    const totalRevenue = revenue.reduce((n: number, r: any) => n + Math.abs(Number(r.balance || 0)), 0);
+    const totalExpense = expenses.reduce((n: number, r: any) => n + Math.abs(Number(r.balance || 0)), 0);
+    return { as_of: query.as_of || new Date().toISOString().slice(0, 10), revenue, expenses, total_revenue: totalRevenue, total_expense: totalExpense, net_profit: totalRevenue - totalExpense };
+  }
+
+  async balanceSheet(tenantId: string, query: any = {}) {
+    const rows = await this.trialBalance(tenantId, query);
+    const assets = rows.filter((r: any) => r.account_type === 'ASSET');
+    const liabilities = rows.filter((r: any) => r.account_type === 'LIABILITY');
+    const equity = rows.filter((r: any) => r.account_type === 'EQUITY');
+    const debitBalance = (list: any[]) => list.reduce((n, r) => n + Number(r.balance || 0), 0);
+    const creditBalance = (list: any[]) => list.reduce((n, r) => n + Math.max(0, -Number(r.balance || 0)), 0);
+    const profit = await this.profitLoss(tenantId, query);
+    const totalAssets = debitBalance(assets);
+    const totalLiabilities = creditBalance(liabilities);
+    const totalEquity = creditBalance(equity) + Number(profit.net_profit || 0);
+    return { as_of: query.as_of || new Date().toISOString().slice(0, 10), assets, liabilities, equity, total_assets: totalAssets, total_liabilities: totalLiabilities, total_equity: totalEquity, retained_earnings: profit.net_profit, balances: { liabilities_and_equity: totalLiabilities + totalEquity } };
+  }
+
+  async accountLedger(tenantId: string, accountId: string, query: any = {}) {
+    const { data: account, error: accountError } = await this.supabase.from('accounting_accounts').select('*').eq('tenant_id', tenantId).eq('id', accountId).maybeSingle();
+    if (accountError) throw new BadRequestException(accountError.message);
+    if (!account) throw new NotFoundException('Account not found');
+    const { data: rawLines, error: lineError } = await this.supabase.from('accounting_journal_lines').select('*').eq('tenant_id', tenantId).eq('account_id', accountId);
+    if (lineError) throw new BadRequestException(lineError.message);
+    const journalIds = [...new Set((rawLines || []).map((line: any) => line.journal_id))];
+    if (!journalIds.length) return { account, opening_balance: Number(account.opening_debit || 0) - Number(account.opening_credit || 0), entries: [], closing_balance: Number(account.opening_debit || 0) - Number(account.opening_credit || 0) };
+    let journalsRequest = this.supabase.from('accounting_journals').select('id,journal_number,journal_date,narration,source_type,status').eq('tenant_id', tenantId).eq('status', 'POSTED').in('id', journalIds);
+    if (query.from) journalsRequest = journalsRequest.gte('journal_date', String(query.from).slice(0, 10));
+    if (query.to) journalsRequest = journalsRequest.lte('journal_date', String(query.to).slice(0, 10));
+    const { data: journals, error: journalError } = await journalsRequest;
+    if (journalError) throw new BadRequestException(journalError.message);
+    const journalMap = new Map((journals || []).map((journal: any) => [journal.id, journal]));
+    let runningBalance = Number(account.opening_debit || 0) - Number(account.opening_credit || 0);
+    const entries = (rawLines || []).filter((line: any) => journalMap.has(line.journal_id)).sort((a: any, b: any) => `${journalMap.get(a.journal_id).journal_date}-${a.line_number}`.localeCompare(`${journalMap.get(b.journal_id).journal_date}-${b.line_number}`)).map((line: any) => {
+      const debit = Number(line.debit || 0); const credit = Number(line.credit || 0); runningBalance += debit - credit;
+      return { ...line, journal: journalMap.get(line.journal_id), debit, credit, running_balance: runningBalance };
+    });
+    return { account, opening_balance: Number(account.opening_debit || 0) - Number(account.opening_credit || 0), entries, closing_balance: runningBalance };
+  }
+
+  async cashFlow(tenantId: string, query: any = {}) {
+    // Reporting screens send a single `as_of` date. Honour it consistently so
+    // cash movement is never calculated through today when an historical
+    // reporting date was selected.
+    const asOf = String(query.as_of || query.to || new Date().toISOString().slice(0, 10)).slice(0, 10);
+    const { data: cashAccounts, error: accountError } = await this.supabase.from('accounting_accounts').select('*').eq('tenant_id', tenantId).eq('is_active', true).in('account_subtype', ['BANK', 'CASH']);
+    if (accountError) throw new BadRequestException(accountError.message);
+    const ids = (cashAccounts || []).map((account: any) => account.id);
+    const openingBalance = (cashAccounts || []).reduce((sum: number, account: any) => sum + Number(account.opening_debit || 0) - Number(account.opening_credit || 0), 0);
+    if (!ids.length) return { as_of: asOf, opening_balance: openingBalance, inflows: [], outflows: [], total_inflows: 0, total_outflows: 0, net_cash_movement: 0, closing_balance: openingBalance };
+    const { data: rawLines, error: lineError } = await this.supabase.from('accounting_journal_lines').select('*').eq('tenant_id', tenantId).in('account_id', ids);
+    if (lineError) throw new BadRequestException(lineError.message);
+    const journalIds = [...new Set((rawLines || []).map((line: any) => line.journal_id))];
+    const { data: journals, error: journalError } = await this.supabase.from('accounting_journals').select('id,journal_date,source_type,narration,status').eq('tenant_id', tenantId).eq('status', 'POSTED').in('id', journalIds.length ? journalIds : ['00000000-0000-0000-0000-000000000000']);
+    if (journalError) throw new BadRequestException(journalError.message);
+    const journalMap = new Map((journals || []).filter((journal: any) => (!query.from || journal.journal_date >= String(query.from).slice(0, 10)) && journal.journal_date <= asOf).map((journal: any) => [journal.id, journal]));
+    const buckets = new Map<string, { label: string; inflow: number; outflow: number }>();
+    for (const line of rawLines || []) {
+      const journal: any = journalMap.get(line.journal_id); if (!journal) continue;
+      const key = journal.source_type || 'MANUAL_JOURNAL'; const bucket = buckets.get(key) || { label: key.replace(/_/g, ' '), inflow: 0, outflow: 0 };
+      bucket.inflow += Number(line.debit || 0); bucket.outflow += Number(line.credit || 0); buckets.set(key, bucket);
+    }
+    const movements = [...buckets.values()].sort((a, b) => a.label.localeCompare(b.label));
+    const totalInflows = movements.reduce((sum, row) => sum + row.inflow, 0); const totalOutflows = movements.reduce((sum, row) => sum + row.outflow, 0);
+    return { as_of: asOf, opening_balance: openingBalance, inflows: movements.filter((row) => row.inflow > 0), outflows: movements.filter((row) => row.outflow > 0), total_inflows: totalInflows, total_outflows: totalOutflows, net_cash_movement: totalInflows - totalOutflows, closing_balance: openingBalance + totalInflows - totalOutflows };
+  }
+
+  async cashForecast(tenantId: string, query: any = {}) {
+    const asOf = String(query.as_of || new Date().toISOString().slice(0, 10)).slice(0, 10);
+    const requestedDays = Number(query.days || 90);
+    const days = Number.isFinite(requestedDays) ? Math.min(365, Math.max(7, Math.floor(requestedDays))) : 90;
+    const endDate = new Date(`${asOf}T00:00:00Z`);
+    endDate.setUTCDate(endDate.getUTCDate() + days);
+    const through = endDate.toISOString().slice(0, 10);
+    const [cash, openItems] = await Promise.all([
+      this.cashFlow(tenantId, { as_of: asOf }),
+      this.listOpenItems(tenantId),
+    ]);
+    const buckets = [
+      { key: 'overdue', label: 'Overdue / due today', from: -Infinity, to: 0, receivables: 0, payables: 0 },
+      { key: 'days_1_7', label: 'Next 7 days', from: 1, to: 7, receivables: 0, payables: 0 },
+      { key: 'days_8_30', label: '8-30 days', from: 8, to: 30, receivables: 0, payables: 0 },
+      { key: 'days_31_60', label: '31-60 days', from: 31, to: 60, receivables: 0, payables: 0 },
+      { key: 'days_61_plus', label: `61-${days} days`, from: 61, to: days, receivables: 0, payables: 0 },
+    ];
+    const asOfTime = new Date(`${asOf}T00:00:00Z`).getTime();
+    const items = (openItems || []).filter((item: any) => ['OPEN', 'PARTIAL'].includes(item.status)).map((item: any) => {
+      const dueDate = String(item.due_date || item.document_date || asOf).slice(0, 10);
+      const dueTime = new Date(`${dueDate}T00:00:00Z`).getTime();
+      const daysFromAsOf = Math.floor((dueTime - asOfTime) / 86400000);
+      const outstanding = Math.max(0, Number(item.original_amount || 0) - Number(item.settled_amount || 0));
+      return { ...item, due_date: dueDate, outstanding, days_from_as_of: daysFromAsOf };
+    }).filter((item: any) => item.outstanding > 0 && item.days_from_as_of <= days);
+    for (const item of items) {
+      const bucket = buckets.find((row) => item.days_from_as_of >= row.from && item.days_from_as_of <= row.to);
+      if (!bucket) continue;
+      if (item.direction === 'RECEIVABLE') bucket.receivables += item.outstanding;
+      if (item.direction === 'PAYABLE') bucket.payables += item.outstanding;
+    }
+    const expectedReceipts = buckets.reduce((sum, row) => sum + row.receivables, 0);
+    const expectedPayments = buckets.reduce((sum, row) => sum + row.payables, 0);
+    return {
+      as_of: asOf,
+      through,
+      horizon_days: days,
+      current_cash: Number(cash.closing_balance || 0),
+      expected_receipts: expectedReceipts,
+      expected_payments: expectedPayments,
+      projected_cash: Number(cash.closing_balance || 0) + expectedReceipts - expectedPayments,
+      buckets: buckets.map((row) => ({ ...row, net_cash_change: row.receivables - row.payables })),
+      items: items.sort((a: any, b: any) => `${a.due_date}-${a.document_number}`.localeCompare(`${b.due_date}-${b.document_number}`)),
+    };
+  }
+
+  async suspenseAccounts(tenantId: string, query: any = {}) {
+    const { data, error } = await this.supabase.from('accounting_accounts').select('*').eq('tenant_id', tenantId).eq('is_suspense_account', true).order('account_code');
+    if (error) throw new BadRequestException(error.message);
+    const balances = await this.trialBalance(tenantId, query);
+    return (data || []).map((account: any) => ({ ...account, balance: balances.find((row: any) => row.id === account.id)?.balance || 0 }));
+  }
+
+  async reverseJournal(tenantId: string, userId: string, id: string, body: any = {}) {
+    const { data: original, error } = await this.supabase.from('accounting_journals').select('*, lines:accounting_journal_lines(*)').eq('tenant_id', tenantId).eq('id', id).maybeSingle();
+    if (error) throw new BadRequestException(error.message);
+    if (!original) throw new NotFoundException('Journal not found');
+    if (original.status !== 'POSTED') throw new BadRequestException('Only a posted journal can be reversed.');
+    const reversal = await this.createJournal(tenantId, userId, { journal_date: body.journal_date || new Date().toISOString().slice(0, 10), journal_number: body.journal_number || `REV-${Date.now()}`, narration: body.narration || `Reversal of ${original.journal_number}`, source_type: 'REVERSAL', source_id: original.id, reversal_of_id: original.id, adjustment_type: 'REVERSAL', lines: (original.lines || []).map((line: any) => ({ ...line, debit: line.credit, credit: line.debit })) });
+    const postedReversal = await this.postJournal(tenantId, reversal.id, userId);
+    const { data, error: updateError } = await this.supabase.from('accounting_journals').update({ status: 'REVERSED', updated_at: new Date().toISOString() }).eq('tenant_id', tenantId).eq('id', id).eq('status', 'POSTED').select().single();
+    if (updateError || !data) throw new BadRequestException(updateError?.message || 'Original journal changed while reversing');
+    return { original: data, reversal: postedReversal };
+  }
+
+  async listOpenItems(tenantId: string, query: any = {}) {
+    let q = this.supabase.from('accounting_open_items').select('*, party:accounting_parties(*)').eq('tenant_id', tenantId).order('due_date', { ascending: true });
+    if (query.direction) q = q.eq('direction', String(query.direction).toUpperCase());
+    if (query.status) q = q.eq('status', String(query.status).toUpperCase());
+    const { data, error } = await q;
+    if (error) throw new BadRequestException(error.message);
+    return data || [];
+  }
+
+  async listParties(tenantId: string, query: any = {}) {
+    let request = this.supabase.from('accounting_parties').select('*').eq('tenant_id', tenantId).order('party_name');
+    if (query.type) request = request.eq('party_type', String(query.type).toUpperCase());
+    if (query.active === 'true' || query.active === 'false') request = request.eq('is_active', query.active === 'true');
+    const { data, error } = await request;
+    if (error) throw new BadRequestException(error.message);
+    return data || [];
+  }
+
+  async createParty(tenantId: string, body: any) {
+    const partyType = String(body.party_type || '').toUpperCase();
+    const partyName = String(body.party_name || '').trim();
+    if (!partyName || !['CUSTOMER', 'SUPPLIER', 'EMPLOYEE', 'OTHER'].includes(partyType)) {
+      throw new BadRequestException('Party name and a valid party type are required.');
+    }
+    const { data, error } = await this.supabase.from('accounting_parties').insert({
+      tenant_id: tenantId,
+      party_type: partyType,
+      party_id: body.party_id || null,
+      party_code: body.party_code ? String(body.party_code).trim().toUpperCase() : null,
+      party_name: partyName,
+      receivable_account_id: body.receivable_account_id || null,
+      payable_account_id: body.payable_account_id || null,
+      credit_limit: Number(body.credit_limit || 0),
+      credit_days: Number(body.credit_days || 0),
+    }).select().single();
+    if (error || !data) throw new BadRequestException(error?.message || 'Accounting party could not be created.');
+    return data;
+  }
+
+  async updateParty(tenantId: string, id: string, body: any) {
+    const payload: any = { updated_at: new Date().toISOString() };
+    if (body.party_name !== undefined) {
+      const partyName = String(body.party_name || '').trim();
+      if (!partyName) throw new BadRequestException('Party name is required.');
+      payload.party_name = partyName;
+    }
+    if (body.party_code !== undefined) payload.party_code = body.party_code ? String(body.party_code).trim().toUpperCase() : null;
+    if (body.receivable_account_id !== undefined) payload.receivable_account_id = body.receivable_account_id || null;
+    if (body.payable_account_id !== undefined) payload.payable_account_id = body.payable_account_id || null;
+    if (body.credit_limit !== undefined) payload.credit_limit = Math.max(0, Number(body.credit_limit || 0));
+    if (body.credit_days !== undefined) payload.credit_days = Math.max(0, Number(body.credit_days || 0));
+    if (body.is_active !== undefined) payload.is_active = Boolean(body.is_active);
+    const { data, error } = await this.supabase.from('accounting_parties').update(payload).eq('tenant_id', tenantId).eq('id', id).select().maybeSingle();
+    if (error) throw new BadRequestException(error.message);
+    if (!data) throw new NotFoundException('Accounting party not found.');
+    return data;
+  }
+
+  async createOpenItem(tenantId: string, body: any) {
+    const amount = Number(body.original_amount || 0);
+    if (!body.document_number || !body.document_date || !['RECEIVABLE', 'PAYABLE'].includes(String(body.direction).toUpperCase()) || amount <= 0) throw new BadRequestException('Document number, date, direction and positive amount are required.');
+    if (!body.party_id) throw new BadRequestException('Select the customer, supplier or other accounting party for this open item.');
+    const { data: party } = await this.supabase.from('accounting_parties').select('id,is_active').eq('tenant_id', tenantId).eq('id', body.party_id).maybeSingle();
+    if (!party || !party.is_active) throw new BadRequestException('Select an active accounting party belonging to this company.');
+    if (body.journal_id) {
+      const { data: journal } = await this.supabase.from('accounting_journals').select('status').eq('tenant_id', tenantId).eq('id', body.journal_id).maybeSingle();
+      if (!journal || journal.status !== 'POSTED') throw new BadRequestException('The source journal must be posted before an open item is created.');
+    }
+    const { data, error } = await this.supabase.from('accounting_open_items').insert({ tenant_id: tenantId, party_id: body.party_id, document_type: body.document_type || 'INVOICE', document_id: body.document_id || null, document_number: body.document_number, document_date: body.document_date, due_date: body.due_date || null, direction: String(body.direction).toUpperCase(), original_amount: amount, currency_code: body.currency_code || 'INR', journal_id: body.journal_id || null }).select().single();
+    if (error || !data) throw new BadRequestException(error?.message || 'Open item could not be created');
+    return data;
+  }
+
+  async settleOpenItem(tenantId: string, userId: string, id: string, body: any) {
+    const amount = Number(body.amount || 0);
+    const { data: item, error: lookupError } = await this.supabase.from('accounting_open_items').select('*').eq('tenant_id', tenantId).eq('id', id).maybeSingle();
+    if (lookupError) throw new BadRequestException(lookupError.message);
+    if (!item) throw new NotFoundException('Open item not found');
+    if (!body.journal_id) throw new BadRequestException('Select the posted payment or receipt journal that clears this outstanding item.');
+    const { data: journal, error: journalError } = await this.supabase.from('accounting_journals').select('id,status').eq('tenant_id', tenantId).eq('id', body.journal_id).maybeSingle();
+    if (journalError) throw new BadRequestException(journalError.message);
+    if (!journal || journal.status !== 'POSTED') throw new BadRequestException('Settlements can only be linked to a posted payment or receipt journal.');
+    const outstanding = Number(item.original_amount) - Number(item.settled_amount);
+    if (amount <= 0 || amount > outstanding + 0.005) throw new BadRequestException(`Settlement must be between 0 and ${outstanding.toFixed(2)}.`);
+    const { data: settlement, error } = await this.supabase.from('accounting_settlements').insert({ tenant_id: tenantId, open_item_id: id, settlement_date: body.settlement_date || new Date().toISOString().slice(0, 10), amount, payment_method: body.payment_method || null, reference_number: body.reference_number || null, journal_id: body.journal_id || null, created_by: userId }).select().single();
+    if (error || !settlement) throw new BadRequestException(error?.message || 'Settlement could not be recorded');
+    const settled = Number(item.settled_amount) + amount;
+    const status = settled >= Number(item.original_amount) - 0.005 ? 'SETTLED' : 'PARTIAL';
+    const { data: updated, error: updateError } = await this.supabase.from('accounting_open_items').update({ settled_amount: settled, status, updated_at: new Date().toISOString() }).eq('tenant_id', tenantId).eq('id', id).select().single();
+    if (updateError || !updated) throw new BadRequestException(updateError?.message || 'Open item could not be updated');
+    return { item: updated, settlement };
+  }
+
+  async createPaymentVoucher(tenantId: string, userId: string, body: any) {
+    const amount = Number(body.amount || 0);
+    const voucherDate = String(body.voucher_date || '').slice(0, 10);
+    if (!body.open_item_id || !body.bank_account_id || !voucherDate || amount <= 0) {
+      throw new BadRequestException('Open item, bank account, voucher date and a positive settlement amount are required.');
+    }
+    const { data: item, error: itemError } = await this.supabase
+      .from('accounting_open_items').select('*, party:accounting_parties(*)')
+      .eq('tenant_id', tenantId).eq('id', body.open_item_id).maybeSingle();
+    if (itemError) throw new BadRequestException(itemError.message);
+    if (!item || !['OPEN', 'PARTIAL'].includes(item.status)) throw new BadRequestException('Select an open customer or supplier document.');
+    const outstanding = Number(item.original_amount || 0) - Number(item.settled_amount || 0);
+    if (amount > outstanding + 0.005) throw new BadRequestException(`Voucher amount cannot exceed outstanding ${outstanding.toFixed(2)}.`);
+    const { data: bank, error: bankError } = await this.supabase
+      .from('accounting_bank_accounts').select('id,bank_name,account_id,is_active')
+      .eq('tenant_id', tenantId).eq('id', body.bank_account_id).maybeSingle();
+    if (bankError) throw new BadRequestException(bankError.message);
+    if (!bank?.is_active || !bank.account_id) throw new BadRequestException('Select an active bank account linked to a ledger.');
+    const party: any = item.party;
+    const controlAccountId = item.direction === 'RECEIVABLE' ? party?.receivable_account_id : party?.payable_account_id;
+    if (!controlAccountId) throw new BadRequestException(`The selected ${item.direction === 'RECEIVABLE' ? 'customer' : 'supplier'} needs a ${item.direction === 'RECEIVABLE' ? 'receivable' : 'payable'} control ledger before a voucher can be posted.`);
+    const type = item.direction === 'RECEIVABLE' ? 'CUSTOMER_RECEIPT' : 'SUPPLIER_PAYMENT';
+    const journal = await this.createJournal(tenantId, userId, {
+      journal_date: voucherDate,
+      journal_number: body.journal_number || undefined,
+      source_type: type,
+      source_id: item.id,
+      narration: String(body.narration || `${item.direction === 'RECEIVABLE' ? 'Receipt from' : 'Payment to'} ${party?.party_name || item.document_number} against ${item.document_number}`).trim(),
+      lines: item.direction === 'RECEIVABLE'
+        ? [{ account_id: bank.account_id, debit: amount, credit: 0, description: `Bank receipt: ${body.reference_number || item.document_number}` }, { account_id: controlAccountId, debit: 0, credit: amount, party_type: party?.party_type || null, party_id: party?.party_id || party?.id || null, description: `Settle ${item.document_number}` }]
+        : [{ account_id: controlAccountId, debit: amount, credit: 0, party_type: party?.party_type || null, party_id: party?.party_id || party?.id || null, description: `Settle ${item.document_number}` }, { account_id: bank.account_id, debit: 0, credit: amount, description: `Bank payment: ${body.reference_number || item.document_number}` }],
+    });
+    const posted = await this.postJournal(tenantId, journal.id, userId);
+    const settlementResult = await this.settleOpenItem(tenantId, userId, item.id, {
+      amount, settlement_date: voucherDate, payment_method: body.payment_method || 'BANK', reference_number: body.reference_number || null, journal_id: posted.id,
+    });
+    const { data: bankTransaction, error: transactionError } = await this.supabase.from('accounting_bank_transactions').insert({
+      tenant_id: tenantId, bank_account_id: bank.id, transaction_date: voucherDate, value_date: body.value_date || voucherDate,
+      reference_number: body.reference_number || posted.journal_number, description: posted.narration, amount,
+      direction: item.direction === 'RECEIVABLE' ? 'IN' : 'OUT', reconciliation_status: 'MATCHED', matched_journal_id: posted.id,
+    }).select().single();
+    if (transactionError) throw new BadRequestException(`Voucher posted, but bank matching record could not be created: ${transactionError.message}`);
+    return { journal: posted, settlement: settlementResult.settlement, open_item: settlementResult.item, bank_transaction: bankTransaction };
+  }
+
+  async listPaymentRuns(tenantId: string) {
+    const { data, error } = await this.supabase.from('accounting_payment_runs').select('*, bank:accounting_bank_accounts(bank_name), items:accounting_payment_run_items(*, open_item:accounting_open_items(document_number,original_amount,settled_amount,party:accounting_parties(party_name)))').eq('tenant_id', tenantId).order('run_date', { ascending: false }).order('created_at', { ascending: false });
+    if (error) throw new BadRequestException(error.message);
+    return data || [];
+  }
+
+  async createPaymentRun(tenantId: string, actor: any, body: any) {
+    const userId = this.actorId(actor);
+    await this.assertWorkflowAssignment(tenantId, actor, 'PAYMENT_PREPARER');
+    const itemInputs = Array.isArray(body.items) ? body.items : [];
+    if (!body.run_date || !body.bank_account_id || !['PAYABLE', 'RECEIVABLE'].includes(String(body.direction || '').toUpperCase()) || !itemInputs.length) throw new BadRequestException('Run date, direction, bank account and at least one open item are required.');
+    const direction = String(body.direction).toUpperCase();
+    const ids = [...new Set(itemInputs.map((item: any) => String(item.open_item_id || '')).filter(Boolean))];
+    if (ids.length !== itemInputs.length) throw new BadRequestException('Each open item can appear only once in a payment run.');
+    const { data: openItems, error: itemError } = await this.supabase.from('accounting_open_items').select('id,direction,status,original_amount,settled_amount').eq('tenant_id', tenantId).in('id', ids);
+    if (itemError || (openItems || []).length !== ids.length) throw new BadRequestException(itemError?.message || 'One or more open items could not be found.');
+    const planned = itemInputs.map((item: any) => {
+      const source = (openItems || []).find((row: any) => row.id === item.open_item_id);
+      const amount = Number(item.planned_amount || 0);
+      const due = Number(source?.original_amount || 0) - Number(source?.settled_amount || 0);
+      if (!source || source.direction !== direction || !['OPEN', 'PARTIAL'].includes(source.status) || amount <= 0 || amount - due > 0.005) throw new BadRequestException('Every run item must be an open document of the selected direction and must not exceed its outstanding amount.');
+      return { ...item, planned_amount: amount };
+    });
+    const total = planned.reduce((sum: number, item: any) => sum + item.planned_amount, 0);
+    const runNumber = String(body.run_number || `PAYRUN-${Date.now()}`);
+    const { data: run, error } = await this.supabase.from('accounting_payment_runs').insert({ tenant_id: tenantId, run_number: runNumber, run_date: String(body.run_date).slice(0, 10), direction, bank_account_id: body.bank_account_id, total_amount: total.toFixed(2), narration: String(body.narration || '').trim() || null, prepared_by: userId }).select().single();
+    if (error || !run) throw new BadRequestException(error?.message || 'Payment run could not be created.');
+    const { error: linesError } = await this.supabase.from('accounting_payment_run_items').insert(planned.map((item: any) => ({ tenant_id: tenantId, payment_run_id: run.id, open_item_id: item.open_item_id, planned_amount: item.planned_amount, reference_number: item.reference_number || null })));
+    if (linesError) { await this.supabase.from('accounting_payment_runs').delete().eq('tenant_id', tenantId).eq('id', run.id); throw new BadRequestException(linesError.message); }
+    return this.listPaymentRuns(tenantId).then((rows) => rows.find((row: any) => row.id === run.id));
+  }
+
+  async approvePaymentRun(tenantId: string, actor: any, id: string) {
+    const userId = this.actorId(actor);
+    await this.assertWorkflowAssignment(tenantId, actor, 'PAYMENT_APPROVER');
+    const { data: run, error } = await this.supabase.from('accounting_payment_runs').select('*').eq('tenant_id', tenantId).eq('id', id).maybeSingle();
+    if (error || !run) throw new NotFoundException('Payment run not found.');
+    if (run.status !== 'DRAFT') throw new BadRequestException('Only draft payment runs can be approved.');
+    if (run.prepared_by && run.prepared_by === userId) throw new BadRequestException('Maker-checker control: the preparer cannot approve their own payment run.');
+    const { data, error: updateError } = await this.supabase.from('accounting_payment_runs').update({ status: 'APPROVED', approved_by: userId, approved_at: new Date().toISOString(), updated_at: new Date().toISOString() }).eq('tenant_id', tenantId).eq('id', id).eq('status', 'DRAFT').select().single();
+    if (updateError || !data) throw new BadRequestException(updateError?.message || 'Payment run could not be approved.');
+    return data;
+  }
+
+  async postPaymentRun(tenantId: string, actor: any, id: string) {
+    const userId = this.actorId(actor);
+    await this.assertWorkflowAssignment(tenantId, actor, 'PAYMENT_POSTER');
+    const { data: run, error } = await this.supabase.from('accounting_payment_runs').select('*, items:accounting_payment_run_items(*)').eq('tenant_id', tenantId).eq('id', id).maybeSingle();
+    if (error || !run) throw new NotFoundException('Payment run not found.');
+    if (!['APPROVED', 'PARTIALLY_POSTED'].includes(run.status)) throw new BadRequestException('Only an approved payment run can be posted.');
+    if ([run.prepared_by, run.approved_by].filter(Boolean).includes(userId)) throw new BadRequestException('Maker-checker control: the poster must be independent from the preparer and approver.');
+    const posted: any[] = [];
+    for (const item of (run.items || []).filter((row: any) => row.status !== 'POSTED')) {
+      try {
+        const result = await this.createPaymentVoucher(tenantId, userId, { open_item_id: item.open_item_id, bank_account_id: run.bank_account_id, voucher_date: run.run_date, value_date: run.run_date, amount: item.planned_amount, payment_method: 'BANK', reference_number: item.reference_number || run.run_number, narration: run.narration || `Payment run ${run.run_number}` });
+        await this.supabase.from('accounting_payment_run_items').update({ status: 'POSTED', payment_journal_id: result.journal.id }).eq('tenant_id', tenantId).eq('id', item.id);
+        posted.push(result.journal.journal_number);
+      } catch (failure: any) {
+        await this.supabase.from('accounting_payment_run_items').update({ status: 'FAILED' }).eq('tenant_id', tenantId).eq('id', item.id);
+        await this.supabase.from('accounting_payment_runs').update({ status: 'PARTIALLY_POSTED', updated_at: new Date().toISOString() }).eq('tenant_id', tenantId).eq('id', id);
+        throw new BadRequestException(`Payment run is partially posted. ${posted.length} payment(s) were posted; correct the failed item and retry. ${failure?.message || ''}`.trim());
+      }
+    }
+    const { data, error: updateError } = await this.supabase.from('accounting_payment_runs').update({ status: 'POSTED', posted_by: userId, posted_at: new Date().toISOString(), updated_at: new Date().toISOString() }).eq('tenant_id', tenantId).eq('id', id).in('status', ['APPROVED', 'PARTIALLY_POSTED']).select().single();
+    if (updateError || !data) throw new BadRequestException(updateError?.message || 'Payment entries were posted but the payment-run status could not be finalised.');
+    return { ...data, posted_journals: posted };
+  }
+
+  async ageing(tenantId: string, direction: string, asOf?: string) {
+    const allRows = await this.listOpenItems(tenantId, { direction });
+    const rows = allRows.filter((row: any) => ['OPEN', 'PARTIAL'].includes(row.status));
+    const date = new Date(asOf || new Date().toISOString().slice(0, 10)).getTime();
+    const buckets = { current: 0, days_1_30: 0, days_31_60: 0, days_61_90: 0, over_90: 0 };
+    const result = rows.map((row: any) => { const due = row.due_date ? new Date(row.due_date).getTime() : date; const days = Math.max(0, Math.floor((date - due) / 86400000)); const outstanding = Number(row.original_amount) - Number(row.settled_amount); if (days === 0) buckets.current += outstanding; else if (days <= 30) buckets.days_1_30 += outstanding; else if (days <= 60) buckets.days_31_60 += outstanding; else if (days <= 90) buckets.days_61_90 += outstanding; else buckets.over_90 += outstanding; return { ...row, outstanding, overdue_days: days }; });
+    return { direction: String(direction).toUpperCase(), as_of: asOf || new Date().toISOString().slice(0, 10), buckets, items: result };
+  }
+
+  async listBankAccounts(tenantId: string) {
+    const { data, error } = await this.supabase.from('accounting_bank_accounts').select('*').eq('tenant_id', tenantId).order('bank_name');
+    if (error) throw new BadRequestException(error.message);
+    return data || [];
+  }
+
+  async createBankAccount(tenantId: string, body: any) {
+    if (!body.bank_name || !body.account_id) throw new BadRequestException('Bank name and ledger account are required.');
+    const { data, error } = await this.supabase.from('accounting_bank_accounts').insert({ tenant_id: tenantId, account_id: body.account_id, bank_name: body.bank_name, account_name: body.account_name || null, account_number_masked: body.account_number_masked || null, ifsc_or_swift: body.ifsc_or_swift || null, currency_code: body.currency_code || 'INR', opening_balance: Number(body.opening_balance || 0) }).select().single();
+    if (error || !data) throw new BadRequestException(error?.message || 'Bank account could not be created');
+    return data;
+  }
+
+  async listBankTransactions(tenantId: string, query: any = {}) {
+    let q = this.supabase.from('accounting_bank_transactions').select('*, bank:accounting_bank_accounts(*)').eq('tenant_id', tenantId).order('transaction_date', { ascending: false });
+    if (query.status) q = q.eq('reconciliation_status', String(query.status).toUpperCase());
+    const { data, error } = await q;
+    if (error) throw new BadRequestException(error.message);
+    return data || [];
+  }
+
+  async createBankTransaction(tenantId: string, body: any) {
+    if (!body.bank_account_id || !body.transaction_date || !['IN', 'OUT'].includes(String(body.direction).toUpperCase()) || Number(body.amount || 0) <= 0) throw new BadRequestException('Bank account, date, direction and positive amount are required.');
+    const { data, error } = await this.supabase.from('accounting_bank_transactions').insert({ tenant_id: tenantId, bank_account_id: body.bank_account_id, transaction_date: body.transaction_date, value_date: body.value_date || null, reference_number: body.reference_number || null, description: body.description || null, amount: Number(body.amount), direction: String(body.direction).toUpperCase() }).select().single();
+    if (error || !data) throw new BadRequestException(error?.message || 'Bank transaction could not be created');
+    return data;
+  }
+
+  async importBankTransactions(tenantId: string, body: any) {
+    const bankAccountId = String(body.bank_account_id || '');
+    const sourceRows = Array.isArray(body.rows) ? body.rows : [];
+    if (!bankAccountId) throw new BadRequestException('Select the bank account for this statement import.');
+    if (!sourceRows.length) throw new BadRequestException('Add at least one statement row to import.');
+    if (sourceRows.length > 500) throw new BadRequestException('Import a maximum of 500 statement rows at a time.');
+    const { data: bank, error: bankError } = await this.supabase.from('accounting_bank_accounts').select('id,is_active').eq('tenant_id', tenantId).eq('id', bankAccountId).maybeSingle();
+    if (bankError || !bank || !bank.is_active) throw new BadRequestException('Select an active bank account before importing the statement.');
+    const normalise = (value: any) => String(value || '').trim();
+    const validRows: any[] = [];
+    const errors: string[] = [];
+    sourceRows.forEach((row: any, index: number) => {
+      const transactionDate = normalise(row.transaction_date);
+      const direction = normalise(row.direction).toUpperCase();
+      const amount = Number(row.amount || 0);
+      if (!/^\d{4}-\d{2}-\d{2}$/.test(transactionDate)) errors.push(`Row ${index + 1}: date must be YYYY-MM-DD.`);
+      else if (!['IN', 'OUT'].includes(direction)) errors.push(`Row ${index + 1}: direction must be IN or OUT.`);
+      else if (!Number.isFinite(amount) || amount <= 0) errors.push(`Row ${index + 1}: amount must be greater than zero.`);
+      else validRows.push({ tenant_id: tenantId, bank_account_id: bankAccountId, transaction_date: transactionDate, value_date: normalise(row.value_date) || null, reference_number: normalise(row.reference_number) || null, description: normalise(row.description) || null, amount, direction });
+    });
+    if (!validRows.length) throw new BadRequestException(errors.join(' '));
+    const firstDate = validRows.reduce((min, row) => row.transaction_date < min ? row.transaction_date : min, validRows[0].transaction_date);
+    const lastDate = validRows.reduce((max, row) => row.transaction_date > max ? row.transaction_date : max, validRows[0].transaction_date);
+    const { data: existing, error: existingError } = await this.supabase.from('accounting_bank_transactions').select('transaction_date,direction,amount,reference_number').eq('tenant_id', tenantId).eq('bank_account_id', bankAccountId).gte('transaction_date', firstDate).lte('transaction_date', lastDate);
+    if (existingError) throw new BadRequestException(existingError.message);
+    const key = (row: any) => `${row.transaction_date}|${row.direction}|${Number(row.amount).toFixed(2)}|${normalise(row.reference_number).toUpperCase()}`;
+    const seen = new Set((existing || []).map(key));
+    const rowsToInsert = validRows.filter((row) => {
+      const rowKey = key(row);
+      if (seen.has(rowKey)) return false;
+      seen.add(rowKey);
+      return true;
+    });
+    let created: any[] = [];
+    if (rowsToInsert.length) {
+      const { data, error } = await this.supabase.from('accounting_bank_transactions').insert(rowsToInsert).select();
+      if (error) throw new BadRequestException(error.message);
+      created = data || [];
+    }
+    return { created_count: created.length, skipped_count: validRows.length - rowsToInsert.length, invalid_count: errors.length, errors, transactions: created };
+  }
+
+  async reconcileBankTransaction(tenantId: string, id: string, body: any) {
+    const status = String(body.status || 'MATCHED').toUpperCase();
+    if (!['MATCHED', 'UNMATCHED', 'EXCLUDED'].includes(status)) throw new BadRequestException('Invalid reconciliation status.');
+    if (status === 'MATCHED') {
+      if (!body.journal_id) throw new BadRequestException('Select the posted receipt or payment journal before matching this bank transaction.');
+      const { data: transaction, error: transactionError } = await this.supabase.from('accounting_bank_transactions').select('amount, bank:accounting_bank_accounts!inner(account_id)').eq('tenant_id', tenantId).eq('id', id).maybeSingle();
+      if (transactionError) throw new BadRequestException(transactionError.message);
+      if (!transaction) throw new NotFoundException('Bank transaction not found');
+      const bankLedgerId = (transaction as any).bank?.account_id;
+      const { data: journal } = await this.supabase.from('accounting_journals').select('status, lines:accounting_journal_lines(account_id, debit, credit)').eq('tenant_id', tenantId).eq('id', body.journal_id).maybeSingle();
+      if (!journal || journal.status !== 'POSTED') throw new BadRequestException('A matched bank transaction must reference a posted journal.');
+      const matchingLedgerLine = (journal.lines || []).find((line: any) => line.account_id === bankLedgerId && Math.abs((Number(line.debit || 0) + Number(line.credit || 0)) - Number(transaction.amount || 0)) < 0.005);
+      if (!matchingLedgerLine) throw new BadRequestException('The selected journal must contain this bank ledger for the exact bank-statement amount.');
+    }
+    const { data, error } = await this.supabase.from('accounting_bank_transactions').update({ reconciliation_status: status, matched_journal_id: body.journal_id || null }).eq('tenant_id', tenantId).eq('id', id).select().maybeSingle();
+    if (error) throw new BadRequestException(error.message);
+    if (!data) throw new NotFoundException('Bank transaction not found');
+    return data;
+  }
+
+  async listTaxCodes(tenantId: string) {
+    const { data, error } = await this.supabase.from('accounting_tax_codes').select('*').eq('tenant_id', tenantId).order('tax_code');
+    if (error) throw new BadRequestException(error.message);
+    return data || [];
+  }
+
+  async taxRegister(tenantId: string, query: any = {}) {
+    const from = String(query.from || `${new Date().getFullYear()}-01-01`).slice(0, 10);
+    const to = String(query.to || new Date().toISOString().slice(0, 10)).slice(0, 10);
+    const { data: codes, error: codeError } = await this.supabase.from('accounting_tax_codes').select('*').eq('tenant_id', tenantId).order('tax_code');
+    if (codeError) throw new BadRequestException(codeError.message);
+    const taxCodes = new Map((codes || []).map((code: any) => [code.tax_code, code]));
+    const { data: journals, error: journalError } = await this.supabase
+      .from('accounting_journals')
+      .select('id,journal_number,journal_date,narration,status,lines:accounting_journal_lines(line_number,tax_code,debit,credit,description)')
+      .eq('tenant_id', tenantId).eq('status', 'POSTED').gte('journal_date', from).lte('journal_date', to)
+      .order('journal_date', { ascending: false }).order('created_at', { ascending: false });
+    if (journalError) throw new BadRequestException(journalError.message);
+    const entries = (journals || []).flatMap((journal: any) => (journal.lines || [])
+      .filter((line: any) => line.tax_code && taxCodes.has(line.tax_code))
+      .map((line: any) => {
+        const tax: any = taxCodes.get(line.tax_code);
+        return { journal_id: journal.id, journal_number: journal.journal_number, journal_date: journal.journal_date, narration: journal.narration, line_number: line.line_number, tax_code: line.tax_code, tax_name: tax.tax_name, tax_type: tax.tax_type, rate: Number(tax.rate || 0), debit: Number(line.debit || 0), credit: Number(line.credit || 0), description: line.description || null };
+      }));
+    const summary = entries.reduce((result: Record<string, any>, entry: any) => {
+      const current = result[entry.tax_code] || { tax_code: entry.tax_code, tax_name: entry.tax_name, tax_type: entry.tax_type, rate: entry.rate, debit: 0, credit: 0, net: 0 };
+      current.debit += entry.debit; current.credit += entry.credit; current.net = current.credit - current.debit;
+      result[entry.tax_code] = current;
+      return result;
+    }, {});
+    return { from, to, entries, summary: Object.values(summary) };
+  }
+
+  async createTaxCode(tenantId: string, body: any) {
+    const code = String(body.tax_code || '').trim().toUpperCase();
+    const type = String(body.tax_type || '').trim().toUpperCase();
+    if (!code || !body.tax_name || !['GST', 'VAT', 'SALES_TAX', 'WITHHOLDING', 'OTHER'].includes(type)) throw new BadRequestException('Tax code, name and valid tax type are required.');
+    const rate = Number(body.rate || 0);
+    if (rate < 0 || rate > 100) throw new BadRequestException('Tax rate must be between 0 and 100.');
+    const { data, error } = await this.supabase.from('accounting_tax_codes').insert({ tenant_id: tenantId, tax_code: code, tax_name: String(body.tax_name).trim(), tax_type: type, rate, input_account_id: body.input_account_id || null, output_account_id: body.output_account_id || null }).select().single();
+    if (error || !data) throw new BadRequestException(error?.code === '23505' ? 'Tax code already exists.' : error?.message || 'Tax code could not be created');
+    return data;
+  }
+
+  async listAssets(tenantId: string) {
+    const { data, error } = await this.supabase.from('accounting_fixed_assets').select('*').eq('tenant_id', tenantId).order('acquisition_date', { ascending: false });
+    if (error) throw new BadRequestException(error.message);
+    return data || [];
+  }
+
+  async createAsset(tenantId: string, body: any) {
+    if (!body.asset_code || !body.asset_name || !body.asset_account_id || !body.acquisition_date || Number(body.cost || 0) <= 0) throw new BadRequestException('Asset code, name, asset account, acquisition date and positive cost are required.');
+    const { data, error } = await this.supabase.from('accounting_fixed_assets').insert({ tenant_id: tenantId, asset_code: String(body.asset_code).trim().toUpperCase(), asset_name: String(body.asset_name).trim(), asset_account_id: body.asset_account_id, depreciation_account_id: body.depreciation_account_id || null, accumulated_depreciation_account_id: body.accumulated_depreciation_account_id || null, acquisition_date: body.acquisition_date, capitalization_date: body.capitalization_date || body.acquisition_date, cost: Number(body.cost), residual_value: Number(body.residual_value || 0), useful_life_months: Number(body.useful_life_months || 60), depreciation_method: body.depreciation_method || 'STRAIGHT_LINE' }).select().single();
+    if (error || !data) throw new BadRequestException(error?.code === '23505' ? 'Asset code already exists.' : error?.message || 'Asset could not be created');
+    return data;
+  }
+
+  async calculateDepreciation(tenantId: string, asOf?: string) {
+    const assets = await this.listAssets(tenantId);
+    const date = new Date(asOf || new Date().toISOString().slice(0, 10));
+    return assets.filter((a: any) => a.status === 'ACTIVE').map((asset: any) => { const base = Math.max(0, Number(asset.cost) - Number(asset.residual_value)); const monthly = Number(asset.useful_life_months) > 0 ? base / Number(asset.useful_life_months) : 0; const start = new Date(asset.capitalization_date || asset.acquisition_date); const months = Math.max(0, (date.getFullYear() - start.getFullYear()) * 12 + date.getMonth() - start.getMonth() + 1); const depreciation = Math.min(base, monthly * months); return { ...asset, monthly_depreciation: Number(monthly.toFixed(2)), depreciation_to_date: Number(depreciation.toFixed(2)), net_book_value: Number((Number(asset.cost) - depreciation).toFixed(2)) }; });
+  }
+
+  async postDepreciation(tenantId: string, userId: string, body: any) {
+    const postingDate = String(body.posting_date || '').slice(0, 10);
+    if (!/^\d{4}-\d{2}-\d{2}$/.test(postingDate)) throw new BadRequestException('A valid depreciation posting date is required.');
+    const periodKey = postingDate.slice(0, 7);
+    const requestedIds = Array.isArray(body.asset_ids) ? body.asset_ids.filter(Boolean) : [];
+    const assets = (await this.listAssets(tenantId)).filter((asset: any) => asset.status === 'ACTIVE' && (!requestedIds.length || requestedIds.includes(asset.id)));
+    if (!assets.length) throw new BadRequestException('Select at least one active asset for depreciation posting.');
+    const incomplete = assets.filter((asset: any) => !asset.depreciation_account_id || !asset.accumulated_depreciation_account_id);
+    if (incomplete.length) throw new BadRequestException(`Configure depreciation expense and accumulated-depreciation ledgers for: ${incomplete.map((asset: any) => asset.asset_code).join(', ')}.`);
+    const sources = assets.map((asset: any) => `DEPRECIATION:${asset.id}:${periodKey}`);
+    const { data: existing, error: existingError } = await this.supabase.from('accounting_journals').select('source_type,journal_number').eq('tenant_id', tenantId).in('source_type', sources);
+    if (existingError) throw new BadRequestException(existingError.message);
+    if (existing?.length) throw new BadRequestException(`Depreciation is already posted for this month: ${existing.map((row: any) => row.journal_number).join(', ')}.`);
+    const posted: any[] = [];
+    for (const asset of assets) {
+      const base = Math.max(0, Number(asset.cost || 0) - Number(asset.residual_value || 0));
+      const monthly = Number(asset.useful_life_months || 0) > 0 ? base / Number(asset.useful_life_months) : 0;
+      const start = new Date(asset.capitalization_date || asset.acquisition_date);
+      const periodDate = new Date(`${periodKey}-01T00:00:00`);
+      const monthsElapsed = Math.max(0, (periodDate.getFullYear() - start.getFullYear()) * 12 + periodDate.getMonth() - start.getMonth() + 1);
+      const amount = Number(Math.min(monthly, Math.max(0, base - monthly * Math.max(0, monthsElapsed - 1))).toFixed(2));
+      if (amount <= 0) continue;
+      const sourceType = `DEPRECIATION:${asset.id}:${periodKey}`;
+      const draft = await this.createJournal(tenantId, userId, {
+        journal_date: postingDate,
+        source_type: sourceType,
+        adjustment_type: 'DEPRECIATION',
+        narration: `Depreciation for ${asset.asset_code} — ${periodKey}`,
+        lines: [
+          { account_id: asset.depreciation_account_id, debit: amount, credit: 0, description: `Depreciation expense: ${asset.asset_name}` },
+          { account_id: asset.accumulated_depreciation_account_id, debit: 0, credit: amount, description: `Accumulated depreciation: ${asset.asset_name}` },
+        ],
+      });
+      posted.push(await this.postJournal(tenantId, draft.id, userId));
+    }
+    if (!posted.length) throw new BadRequestException('No depreciation amount is due for the selected assets in this month.');
+    return { posting_date: postingDate, period: periodKey, journals: posted, total_depreciation: posted.reduce((sum, journal) => sum + Number(journal.total_debit || 0), 0) };
+  }
+
+  async listBudgets(tenantId: string) {
+    const { data, error } = await this.supabase.from('accounting_budgets').select('*, lines:accounting_budget_lines(*)').eq('tenant_id', tenantId).order('fiscal_year', { ascending: false });
+    if (error) throw new BadRequestException(error.message);
+    return data || [];
+  }
+
+  async createBudget(tenantId: string, userId: string, body: any) {
+    if (!body.budget_name || !body.fiscal_year) throw new BadRequestException('Budget name and fiscal year are required.');
+    const lines = Array.isArray(body.lines) ? body.lines : [];
+    if (!lines.length) throw new BadRequestException('At least one budget line is required.');
+    const { data: budget, error } = await this.supabase.from('accounting_budgets').insert({ tenant_id: tenantId, budget_name: String(body.budget_name).trim(), fiscal_year: String(body.fiscal_year).trim(), created_by: userId }).select().single();
+    if (error || !budget) throw new BadRequestException(error?.message || 'Budget could not be created');
+    const rows = lines.map((line: any) => ({ tenant_id: tenantId, budget_id: budget.id, account_id: line.account_id, period_start: line.period_start, amount: Number(line.amount || 0), cost_center: line.cost_center || null }));
+    const { data: savedLines, error: lineError } = await this.supabase.from('accounting_budget_lines').insert(rows).select();
+    if (lineError) { await this.supabase.from('accounting_budgets').delete().eq('tenant_id', tenantId).eq('id', budget.id); throw new BadRequestException(lineError.message); }
+    return { ...budget, lines: savedLines || [] };
+  }
+
+  async approveBudget(tenantId: string, id: string) {
+    const { data, error } = await this.supabase.from('accounting_budgets').update({ status: 'APPROVED' }).eq('tenant_id', tenantId).eq('id', id).eq('status', 'DRAFT').select().maybeSingle();
+    if (error) throw new BadRequestException(error.message);
+    if (!data) throw new NotFoundException('Draft budget not found');
+    return data;
+  }
+
+  async budgetVariance(tenantId: string, id: string, query: any = {}) {
+    const { data: budget, error } = await this.supabase.from('accounting_budgets').select('*, lines:accounting_budget_lines(*)').eq('tenant_id', tenantId).eq('id', id).maybeSingle();
+    if (error) throw new BadRequestException(error.message);
+    if (!budget) throw new NotFoundException('Budget not found');
+    const from = query.from || `${String(budget.fiscal_year).slice(0, 4)}-01-01`;
+    const to = query.to || `${String(budget.fiscal_year).slice(0, 4)}-12-31`;
+    const { data: lines, error: lineError } = await this.supabase.from('accounting_journal_lines').select('account_id,debit,credit,journal:accounting_journals!inner(journal_date,status)').eq('tenant_id', tenantId).eq('journal.status', 'POSTED').gte('journal.journal_date', from).lte('journal.journal_date', to);
+    if (lineError) throw new BadRequestException(lineError.message);
+    const accountIds = [...new Set((budget.lines || []).map((line: any) => line.account_id).filter(Boolean))];
+    const { data: accounts, error: accountError } = await this.supabase.from('accounting_accounts').select('id,account_code,account_name,account_type').eq('tenant_id', tenantId).in('id', accountIds.length ? accountIds : ['00000000-0000-0000-0000-000000000000']);
+    if (accountError) throw new BadRequestException(accountError.message);
+    const accountMap = new Map((accounts || []).map((account: any) => [account.id, account]));
+    const actual = new Map<string, number>();
+    for (const line of lines || []) {
+      const journal = Array.isArray((line as any).journal) ? (line as any).journal[0] : (line as any).journal;
+      const periodStart = String(journal?.journal_date || '').slice(0, 7);
+      if (!periodStart) continue;
+      const key = `${line.account_id}|${periodStart}`;
+      actual.set(key, (actual.get(key) || 0) + Number(line.debit || 0) - Number(line.credit || 0));
+    }
+    const result = (budget.lines || []).map((line: any) => {
+      const periodKey = String(line.period_start || '').slice(0, 7);
+      const amount = Number(line.amount || 0);
+      const actualAmount = actual.get(`${line.account_id}|${periodKey}`) || 0;
+      return { ...line, account: accountMap.get(line.account_id) || null, actual: Number(actualAmount.toFixed(2)), variance: Number((amount - actualAmount).toFixed(2)), variance_status: actualAmount > amount ? 'OVER_BUDGET' : actualAmount === amount ? 'ON_BUDGET' : 'UNDER_BUDGET' };
+    });
+    return { budget: { id: budget.id, budget_name: budget.budget_name, fiscal_year: budget.fiscal_year, status: budget.status }, from, to, totals: { budget: result.reduce((sum: number, line: any) => sum + Number(line.amount || 0), 0), actual: result.reduce((sum: number, line: any) => sum + Number(line.actual || 0), 0) }, lines: result };
+  }
+
+  async costCentreReport(tenantId: string, query: any = {}) {
+    const today = new Date().toISOString().slice(0, 10);
+    const from = String(query.from || `${new Date().getFullYear()}-01-01`).slice(0, 10);
+    const to = String(query.to || today).slice(0, 10);
+    if (!/^\d{4}-\d{2}-\d{2}$/.test(from) || !/^\d{4}-\d{2}-\d{2}$/.test(to) || from > to) {
+      throw new BadRequestException('Enter a valid cost-centre reporting date range.');
+    }
+    const { data: lines, error } = await this.supabase
+      .from('accounting_journal_lines')
+      .select('id,account_id,cost_center,description,debit,credit,journal:accounting_journals!inner(journal_number,journal_date,narration,status),account:accounting_accounts!inner(account_code,account_name,account_type)')
+      .eq('tenant_id', tenantId)
+      .eq('journal.status', 'POSTED')
+      .gte('journal.journal_date', from)
+      .lte('journal.journal_date', to);
+    if (error) throw new BadRequestException(error.message);
+    const grouped = new Map<string, { cost_center: string; debit: number; credit: number; entries: number }>();
+    for (const line of lines || []) {
+      const centre = String((line as any).cost_center || 'UNASSIGNED').trim() || 'UNASSIGNED';
+      const current = grouped.get(centre) || { cost_center: centre, debit: 0, credit: 0, entries: 0 };
+      current.debit += Number((line as any).debit || 0);
+      current.credit += Number((line as any).credit || 0);
+      current.entries += 1;
+      grouped.set(centre, current);
+    }
+    const centres = [...grouped.values()]
+      .map((row) => ({ ...row, debit: Number(row.debit.toFixed(2)), credit: Number(row.credit.toFixed(2)), net: Number((row.debit - row.credit).toFixed(2)) }))
+      .sort((a, b) => Math.abs(b.net) - Math.abs(a.net) || a.cost_center.localeCompare(b.cost_center));
+    const detail = (lines || []).map((line: any) => {
+      const journal = Array.isArray(line.journal) ? line.journal[0] : line.journal;
+      const account = Array.isArray(line.account) ? line.account[0] : line.account;
+      return {
+        id: line.id, cost_center: String(line.cost_center || 'UNASSIGNED').trim() || 'UNASSIGNED', debit: Number(line.debit || 0), credit: Number(line.credit || 0),
+        description: line.description || null, journal_date: journal?.journal_date, journal_number: journal?.journal_number, narration: journal?.narration,
+        account_code: account?.account_code, account_name: account?.account_name, account_type: account?.account_type,
+      };
+    }).sort((a: any, b: any) => `${b.journal_date || ''}|${b.journal_number || ''}`.localeCompare(`${a.journal_date || ''}|${a.journal_number || ''}`));
+    return { from, to, totals: { debit: centres.reduce((sum, row) => sum + row.debit, 0), credit: centres.reduce((sum, row) => sum + row.credit, 0) }, centres, lines: detail };
+  }
+
+  async listOpeningBalanceBatches(tenantId: string) {
+    const { data, error } = await this.supabase.from('accounting_opening_balance_batches').select('*, lines:accounting_opening_balance_lines(*, account:accounting_accounts(account_code,account_name)), suspense:accounting_accounts!accounting_opening_balance_batches_suspense_account_id_fkey(account_code,account_name), journal:accounting_journals(journal_number,status)').eq('tenant_id', tenantId).order('as_of_date', { ascending: false });
+    if (error) throw new BadRequestException(error.message);
+    return data || [];
+  }
+
+  async createOpeningBalanceBatch(tenantId: string, userId: string, body: any) {
+    const lines = Array.isArray(body.lines) ? body.lines : [];
+    if (!body.as_of_date || !lines.length) throw new BadRequestException('Opening date and at least one opening-balance line are required.');
+    const prepared = lines.map((line: any) => ({ account_id: String(line.account_id || ''), description: String(line.description || '').trim() || null, debit: Number(line.debit || 0), credit: Number(line.credit || 0), party_type: line.party_type || null, party_id: line.party_id || null })).filter((line: any) => line.account_id && (line.debit > 0 || line.credit > 0));
+    if (!prepared.length || prepared.some((line: any) => line.debit < 0 || line.credit < 0 || (line.debit > 0 && line.credit > 0))) throw new BadRequestException('Each opening-balance line needs one positive debit or credit amount.');
+    const { data: batch, error } = await this.supabase.from('accounting_opening_balance_batches').insert({ tenant_id: tenantId, batch_number: String(body.batch_number || `OB-${Date.now()}`), as_of_date: String(body.as_of_date).slice(0, 10), suspense_account_id: body.suspense_account_id || null, source_reference: String(body.source_reference || '').trim() || null, prepared_by: userId }).select().single();
+    if (error || !batch) throw new BadRequestException(error?.message || 'Opening-balance batch could not be created.');
+    const { error: lineError } = await this.supabase.from('accounting_opening_balance_lines').insert(prepared.map((line: any) => ({ tenant_id: tenantId, opening_balance_batch_id: batch.id, ...line })));
+    if (lineError) { await this.supabase.from('accounting_opening_balance_batches').delete().eq('tenant_id', tenantId).eq('id', batch.id); throw new BadRequestException(lineError.message); }
+    return batch;
+  }
+
+  async validateOpeningBalanceBatch(tenantId: string, userId: string, id: string) {
+    const { data: batch, error } = await this.supabase.from('accounting_opening_balance_batches').select('*, lines:accounting_opening_balance_lines(*)').eq('tenant_id', tenantId).eq('id', id).maybeSingle();
+    if (error || !batch) throw new NotFoundException('Opening-balance batch not found.');
+    if (batch.status !== 'DRAFT') throw new BadRequestException('Only draft opening-balance batches can be validated.');
+    if (batch.prepared_by === userId) throw new BadRequestException('Maker-checker control: the preparer cannot validate their own opening balances.');
+    const debit = (batch.lines || []).reduce((sum: number, line: any) => sum + Number(line.debit || 0), 0);
+    const credit = (batch.lines || []).reduce((sum: number, line: any) => sum + Number(line.credit || 0), 0);
+    if (Math.abs(debit - credit) > 0.005 && !batch.suspense_account_id) throw new BadRequestException(`Opening balances differ by ${(debit - credit).toFixed(2)}. Select a suspense account or correct the source balances.`);
+    const { data, error: updateError } = await this.supabase.from('accounting_opening_balance_batches').update({ status: 'VALIDATED', validated_by: userId, updated_at: new Date().toISOString() }).eq('tenant_id', tenantId).eq('id', id).select().single();
+    if (updateError || !data) throw new BadRequestException(updateError?.message || 'Opening-balance validation failed.');
+    return { ...data, debit, credit, suspense_required: Math.abs(debit - credit) > 0.005 };
+  }
+
+  async postOpeningBalanceBatch(tenantId: string, userId: string, id: string) {
+    const { data: batch, error } = await this.supabase.from('accounting_opening_balance_batches').select('*, lines:accounting_opening_balance_lines(*)').eq('tenant_id', tenantId).eq('id', id).maybeSingle();
+    if (error || !batch) throw new NotFoundException('Opening-balance batch not found.');
+    if (batch.status !== 'VALIDATED') throw new BadRequestException('Only validated opening-balance batches can be posted.');
+    if ([batch.prepared_by, batch.validated_by].filter(Boolean).includes(userId)) throw new BadRequestException('Maker-checker control: posting must be done by a third finance user.');
+    const lines = (batch.lines || []).map((line: any) => ({ account_id: line.account_id, description: line.description || 'Opening balance', debit: Number(line.debit || 0), credit: Number(line.credit || 0), party_type: line.party_type, party_id: line.party_id }));
+    const debit = lines.reduce((sum: number, line: any) => sum + line.debit, 0); const credit = lines.reduce((sum: number, line: any) => sum + line.credit, 0);
+    if (Math.abs(debit - credit) > 0.005) lines.push(debit > credit ? { account_id: batch.suspense_account_id, description: 'Opening balance suspense', debit: 0, credit: debit - credit } : { account_id: batch.suspense_account_id, description: 'Opening balance suspense', debit: credit - debit, credit: 0 });
+    const journal = await this.createJournal(tenantId, userId, { journal_date: batch.as_of_date, source_type: 'OPENING_BALANCE', source_id: batch.id, narration: `Opening balance batch ${batch.batch_number}${batch.source_reference ? ` — ${batch.source_reference}` : ''}`, lines });
+    const posted = await this.postJournal(tenantId, journal.id, userId);
+    const { data, error: updateError } = await this.supabase.from('accounting_opening_balance_batches').update({ status: 'POSTED', posted_by: userId, posted_journal_id: posted.id, updated_at: new Date().toISOString() }).eq('tenant_id', tenantId).eq('id', id).select().single();
+    if (updateError || !data) throw new BadRequestException(updateError?.message || 'Opening balance journal posted but batch could not be finalised.');
+    return { batch: data, journal: posted };
+  }
+
+  async listStatutoryReturns(tenantId: string) { const { data, error } = await this.supabase.from('accounting_statutory_returns').select('*').eq('tenant_id', tenantId).order('period_to', { ascending: false }); if (error) throw new BadRequestException(error.message); return data || []; }
+  async createStatutoryReturn(tenantId: string, userId: string, body: any) { if (!body.return_type || !body.period_from || !body.period_to || String(body.period_from) > String(body.period_to)) throw new BadRequestException('Return type and a valid reporting period are required.'); const { data, error } = await this.supabase.from('accounting_statutory_returns').insert({ tenant_id: tenantId, return_type: String(body.return_type).toUpperCase(), period_from: String(body.period_from).slice(0, 10), period_to: String(body.period_to).slice(0, 10), reference_number: body.reference_number || null, totals: body.totals || {}, working_note: body.working_note || null, prepared_by: userId }).select().single(); if (error || !data) throw new BadRequestException(error?.message || 'Statutory return could not be created.'); return data; }
+  async updateStatutoryReturn(tenantId: string, userId: string, id: string, body: any) { const { data: current, error } = await this.supabase.from('accounting_statutory_returns').select('*').eq('tenant_id', tenantId).eq('id', id).maybeSingle(); if (error || !current) throw new NotFoundException('Statutory return not found.'); if (['FILED'].includes(current.status)) throw new BadRequestException('A filed statutory return is immutable; create a revision instead.'); const nextStatus = body.status ? String(body.status).toUpperCase() : current.status; if (nextStatus === 'REVIEWED' && current.prepared_by === userId) throw new BadRequestException('Maker-checker control: preparer cannot review their own return.'); if (nextStatus === 'FILED' && current.status !== 'REVIEWED') throw new BadRequestException('Review the return before filing.'); const patch: any = { ...body, status: nextStatus, updated_at: new Date().toISOString() }; delete patch.id; delete patch.tenant_id; if (nextStatus === 'REVIEWED') patch.reviewed_by = userId; if (nextStatus === 'FILED') patch.filed_at = new Date().toISOString(); const { data, error: updateError } = await this.supabase.from('accounting_statutory_returns').update(patch).eq('tenant_id', tenantId).eq('id', id).select().single(); if (updateError || !data) throw new BadRequestException(updateError?.message || 'Statutory return could not be updated.'); return data; }
+  async listReportSchedules(tenantId: string) { const { data, error } = await this.supabase.from('accounting_report_schedules').select('*').eq('tenant_id', tenantId).order('created_at', { ascending: false }); if (error) throw new BadRequestException(error.message); return data || []; }
+  async createReportSchedule(tenantId: string, userId: string, body: any) { if (!body.report_code || !body.schedule_name || !['DAILY', 'WEEKLY', 'MONTHLY', 'QUARTERLY'].includes(String(body.frequency).toUpperCase())) throw new BadRequestException('Report, schedule name and frequency are required.'); const recipients = Array.isArray(body.recipients) ? body.recipients.filter(Boolean) : String(body.recipients || '').split(/[;,]/).map((x) => x.trim()).filter(Boolean); const { data, error } = await this.supabase.from('accounting_report_schedules').insert({ tenant_id: tenantId, report_code: String(body.report_code).toUpperCase(), schedule_name: body.schedule_name, frequency: String(body.frequency).toUpperCase(), recipients, filters: body.filters || {}, is_active: !!body.is_active, created_by: userId }).select().single(); if (error || !data) throw new BadRequestException(error?.message || 'Report schedule could not be created.'); return data; }
+  async updateReportSchedule(tenantId: string, id: string, body: any) { const patch: any = { ...body, updated_at: new Date().toISOString() }; if (typeof patch.recipients === 'string') patch.recipients = patch.recipients.split(/[;,]/).map((x: string) => x.trim()).filter(Boolean); delete patch.id; delete patch.tenant_id; const { data, error } = await this.supabase.from('accounting_report_schedules').update(patch).eq('tenant_id', tenantId).eq('id', id).select().single(); if (error || !data) throw new BadRequestException(error?.message || 'Report schedule could not be updated.'); return data; }
+
+  async partyStatement(tenantId: string, partyId: string, query: any = {}) {
+    const asOf = String(query.as_of || new Date().toISOString().slice(0, 10)).slice(0, 10);
+    const { data: party, error: partyError } = await this.supabase.from('accounting_parties').select('*').eq('tenant_id', tenantId).eq('id', partyId).maybeSingle();
+    if (partyError) throw new BadRequestException(partyError.message);
+    if (!party) throw new NotFoundException('Accounting party not found.');
+    const { data: items, error: itemError } = await this.supabase.from('accounting_open_items').select('*').eq('tenant_id', tenantId).eq('party_id', partyId).lte('document_date', asOf).order('document_date').order('created_at');
+    if (itemError) throw new BadRequestException(itemError.message);
+    const ids = (items || []).map((item: any) => item.id);
+    const { data: settlements, error: settlementError } = ids.length
+      ? await this.supabase.from('accounting_settlements').select('*').eq('tenant_id', tenantId).in('open_item_id', ids).lte('settlement_date', asOf).order('settlement_date')
+      : { data: [], error: null } as any;
+    if (settlementError) throw new BadRequestException(settlementError.message);
+    const events = [
+      ...(items || []).map((item: any) => ({ date: item.document_date, type: item.document_type, reference: item.document_number, debit: item.direction === 'RECEIVABLE' ? Number(item.original_amount || 0) : 0, credit: item.direction === 'PAYABLE' ? Number(item.original_amount || 0) : 0, open_item_id: item.id })),
+      ...(settlements || []).map((row: any) => {
+        const item = (items || []).find((candidate: any) => candidate.id === row.open_item_id);
+        return { date: row.settlement_date, type: 'SETTLEMENT', reference: row.reference_number || 'Payment / receipt', debit: item?.direction === 'PAYABLE' ? Number(row.amount || 0) : 0, credit: item?.direction === 'RECEIVABLE' ? Number(row.amount || 0) : 0, open_item_id: row.open_item_id };
+      }),
+    ].sort((a: any, b: any) => `${a.date}|${a.reference}`.localeCompare(`${b.date}|${b.reference}`));
+    let balance = 0;
+    const transactions = events.map((event: any) => ({ ...event, balance: Number((balance += Number(event.debit || 0) - Number(event.credit || 0)).toFixed(2)) }));
+    const outstanding = (items || []).reduce((sum: number, item: any) => sum + Math.max(0, Number(item.original_amount || 0) - Number(item.settled_amount || 0)), 0);
+    return { party, as_of: asOf, opening_balance: 0, closing_balance: Number(balance.toFixed(2)), outstanding: Number(outstanding.toFixed(2)), transactions };
+  }
+
+  async paymentRunRemittances(tenantId: string, paymentRunId: string) {
+    const { data, error } = await this.supabase.from('accounting_payment_remittances').select('*, party:accounting_parties(party_name,party_code), item:accounting_payment_run_items(reference_number,planned_amount)').eq('tenant_id', tenantId).eq('payment_run_id', paymentRunId).order('created_at');
+    if (error) throw new BadRequestException(error.message);
+    return data || [];
+  }
+
+  async preparePaymentRunRemittances(tenantId: string, actor: any, paymentRunId: string, body: any = {}) {
+    const userId = this.actorId(actor);
+    const { data: run, error } = await this.supabase.from('accounting_payment_runs').select('*, items:accounting_payment_run_items(*, open_item:accounting_open_items(*, party:accounting_parties(*)))').eq('tenant_id', tenantId).eq('id', paymentRunId).maybeSingle();
+    if (error) throw new BadRequestException(error.message);
+    if (!run) throw new NotFoundException('Payment run not found.');
+    if (!['APPROVED', 'POSTED', 'PARTIALLY_POSTED'].includes(run.status)) throw new BadRequestException('Approve the payment run before preparing remittance advice.');
+    const rows = (run.items || []).filter((item: any) => item.status !== 'CANCELLED').map((item: any, index: number) => {
+      const party = item.open_item?.party;
+      const number = `REM-${run.run_number}-${String(index + 1).padStart(3, '0')}`;
+      return { tenant_id: tenantId, payment_run_id: paymentRunId, payment_run_item_id: item.id, party_id: item.open_item?.party_id || null, remittance_number: number, recipient_email: party?.email || body.recipient_email || null, subject: `Remittance advice ${run.run_number}`, message_body: `Payment advice for ${item.open_item?.document_number || item.reference_number || 'supplier document'}: ${Number(item.planned_amount || 0).toFixed(2)}.`, amount: Number(item.planned_amount || 0), status: 'READY', created_by: userId };
+    });
+    if (!rows.length) throw new BadRequestException('This payment run has no eligible lines for remittance advice.');
+    const { error: insertError } = await this.supabase.from('accounting_payment_remittances').upsert(rows, { onConflict: 'tenant_id,remittance_number', ignoreDuplicates: true });
+    if (insertError) throw new BadRequestException(insertError.message);
+    return this.paymentRunRemittances(tenantId, paymentRunId);
+  }
+
+  async markRemittanceSent(tenantId: string, actor: any, id: string, body: any = {}) {
+    const { data, error } = await this.supabase.from('accounting_payment_remittances').update({ status: 'SENT', recipient_email: body.recipient_email || undefined, provider_reference: body.provider_reference || null, sent_at: new Date().toISOString(), updated_at: new Date().toISOString() }).eq('tenant_id', tenantId).eq('id', id).in('status', ['DRAFT', 'READY', 'FAILED']).select().maybeSingle();
+    if (error) throw new BadRequestException(error.message);
+    if (!data) throw new BadRequestException('Remittance advice could not be marked sent. It may already be sent or cancelled.');
+    return data;
+  }
+
+  async periodCloseTasks(tenantId: string, periodId: string) {
+    const defaults = [
+      ['BANK_RECON', 'Complete bank reconciliation', 'TREASURY', true],
+      ['AR_REVIEW', 'Review receivables ageing and collection actions', 'SUBLEDGER', false],
+      ['AP_REVIEW', 'Review payables ageing and unrecorded liabilities', 'SUBLEDGER', false],
+      ['TAX_RECON', 'Reconcile GST / VAT / withholding tax registers', 'STATUTORY', true],
+      ['ACCRUALS', 'Post required accruals and prepayments', 'ADJUSTMENTS', false],
+      ['DEPRECIATION', 'Run and review depreciation', 'ADJUSTMENTS', false],
+      ['FX_REVALUATION', 'Review foreign-currency revaluation', 'ADJUSTMENTS', false],
+      ['MANAGEMENT_REVIEW', 'Approve management reports and close pack', 'REPORTING', true],
+    ];
+    const { error: seedError } = await this.supabase.from('accounting_period_close_tasks').upsert(defaults.map(([task_code, task_name, task_group, is_blocking]) => ({ tenant_id: tenantId, period_id: periodId, task_code, task_name, task_group, is_blocking })), { onConflict: 'tenant_id,period_id,task_code', ignoreDuplicates: true });
+    if (seedError) throw new BadRequestException(seedError.message);
+    const { data, error } = await this.supabase.from('accounting_period_close_tasks').select('*').eq('tenant_id', tenantId).eq('period_id', periodId).order('task_group').order('task_code');
+    if (error) throw new BadRequestException(error.message);
+    return data || [];
+  }
+
+  async updatePeriodCloseTask(tenantId: string, actor: any, id: string, body: any) {
+    const status = body.status ? String(body.status).toUpperCase() : undefined;
+    if (status && !['OPEN', 'IN_REVIEW', 'COMPLETE', 'WAIVED'].includes(status)) throw new BadRequestException('Invalid period-close task status.');
+    const patch: any = { updated_at: new Date().toISOString() };
+    if (status) { patch.status = status; if (['COMPLETE', 'WAIVED'].includes(status)) { patch.completed_by = this.actorId(actor); patch.completed_at = new Date().toISOString(); } }
+    if (body.note !== undefined) patch.note = String(body.note || '').trim() || null;
+    if (body.owner_id !== undefined) patch.owner_id = body.owner_id || null;
+    const { data, error } = await this.supabase.from('accounting_period_close_tasks').update(patch).eq('tenant_id', tenantId).eq('id', id).select().maybeSingle();
+    if (error) throw new BadRequestException(error.message);
+    if (!data) throw new NotFoundException('Period-close task not found.');
+    return data;
+  }
+
+  async comparativeFinancials(tenantId: string, query: any = {}) {
+    const currentAsOf = String(query.as_of || new Date().toISOString().slice(0, 10)).slice(0, 10);
+    const comparisonAsOf = String(query.compare_as_of || new Date(new Date(`${currentAsOf}T00:00:00Z`).setUTCFullYear(new Date(`${currentAsOf}T00:00:00Z`).getUTCFullYear() - 1)).toISOString().slice(0, 10)).slice(0, 10);
+    const [currentPL, priorPL, currentBS, priorBS, currentCash, priorCash] = await Promise.all([
+      this.profitLoss(tenantId, { as_of: currentAsOf }), this.profitLoss(tenantId, { as_of: comparisonAsOf }),
+      this.balanceSheet(tenantId, { as_of: currentAsOf }), this.balanceSheet(tenantId, { as_of: comparisonAsOf }),
+      this.cashFlow(tenantId, { as_of: currentAsOf }), this.cashFlow(tenantId, { as_of: comparisonAsOf }),
+    ]);
+    const compare = (current: number, prior: number) => ({ current, prior, variance: Number((current - prior).toFixed(2)), variance_percent: prior ? Number((((current - prior) / Math.abs(prior)) * 100).toFixed(2)) : null });
+    return { as_of: currentAsOf, compare_as_of: comparisonAsOf, profit_loss: { revenue: compare(Number(currentPL.total_revenue), Number(priorPL.total_revenue)), expense: compare(Number(currentPL.total_expense), Number(priorPL.total_expense)), profit: compare(Number(currentPL.net_profit), Number(priorPL.net_profit)) }, balance_sheet: { assets: compare(Number(currentBS.total_assets), Number(priorBS.total_assets)), liabilities: compare(Number(currentBS.total_liabilities), Number(priorBS.total_liabilities)), equity: compare(Number(currentBS.total_equity), Number(priorBS.total_equity)) }, cash: { closing: compare(Number(currentCash.closing_balance), Number(priorCash.closing_balance)), movement: compare(Number(currentCash.net_cash_movement), Number(priorCash.net_cash_movement)) } };
+  }
+
+  async accountingAuditTrail(tenantId: string, query: any = {}) {
+    const limit = Math.min(500, Math.max(1, Number(query.limit || 100)));
+    const [journals, workflow, sourcePostings] = await Promise.all([
+      this.supabase.from('accounting_journals').select('id,journal_number,journal_date,status,narration,source_type,created_at,posted_at,created_by,posted_by').eq('tenant_id', tenantId).order('updated_at', { ascending: false }).limit(limit),
+      this.supabase.from('accounting_journal_workflow_events').select('*, journal:accounting_journals(journal_number)').eq('tenant_id', tenantId).order('created_at', { ascending: false }).limit(limit),
+      this.supabase.from('accounting_source_postings').select('*, journal:accounting_journals(journal_number,status)').eq('tenant_id', tenantId).order('created_at', { ascending: false }).limit(limit),
+    ]);
+    for (const result of [journals, workflow, sourcePostings]) if (result.error) throw new BadRequestException(result.error.message);
+    return { journals: journals.data || [], workflow_events: workflow.data || [], source_postings: sourcePostings.data || [] };
+  }
+
+  async fxRevaluationPreview(tenantId: string, query: any = {}) {
+    const asOf = String(query.as_of || new Date().toISOString().slice(0, 10)).slice(0, 10);
+    const functionalCurrency = String(query.functional_currency_code || 'INR').toUpperCase();
+    const { data: lines, error } = await this.supabase.from('accounting_journal_lines').select('account_id,foreign_debit,foreign_credit,debit,credit,journal:accounting_journals!inner(journal_date,status,transaction_currency_code,exchange_rate),account:accounting_accounts!inner(account_code,account_name,account_type)').eq('tenant_id', tenantId).eq('journal.status', 'POSTED').lte('journal.journal_date', asOf);
+    if (error) throw new BadRequestException(error.message);
+    const groups = new Map<string, any>();
+    for (const row of lines || []) {
+      const journal = Array.isArray((row as any).journal) ? (row as any).journal[0] : (row as any).journal;
+      const currency = String(journal?.transaction_currency_code || functionalCurrency).toUpperCase();
+      if (currency === functionalCurrency) continue;
+      const key = `${row.account_id}|${currency}`;
+      const current = groups.get(key) || { account_id: row.account_id, account: (row as any).account, currency_code: currency, foreign_balance: 0, base_balance: 0, weighted_rate_numerator: 0, weighted_rate_denominator: 0 };
+      const foreign = Number(row.foreign_debit ?? row.debit ?? 0) - Number(row.foreign_credit ?? row.credit ?? 0);
+      const base = Number(row.debit || 0) - Number(row.credit || 0);
+      current.foreign_balance += foreign; current.base_balance += base; current.weighted_rate_numerator += Math.abs(foreign) * Number(journal?.exchange_rate || 1); current.weighted_rate_denominator += Math.abs(foreign);
+      groups.set(key, current);
+    }
+    const preview: any[] = [];
+    for (const row of groups.values()) {
+      if (Math.abs(row.foreign_balance) < 0.005) continue;
+      const { data: rate, error: rateError } = await this.supabase.from('accounting_exchange_rates').select('exchange_rate,rate_date').eq('tenant_id', tenantId).eq('from_currency_code', row.currency_code).eq('to_currency_code', functionalCurrency).eq('is_active', true).lte('rate_date', asOf).order('rate_date', { ascending: false }).limit(1).maybeSingle();
+      if (rateError) throw new BadRequestException(rateError.message);
+      if (!rate) continue;
+      const historicRate = row.weighted_rate_denominator ? row.weighted_rate_numerator / row.weighted_rate_denominator : 1;
+      const revalued = row.foreign_balance * Number(rate.exchange_rate);
+      const difference = revalued - row.base_balance;
+      preview.push({ ...row, foreign_balance: Number(row.foreign_balance.toFixed(2)), base_balance: Number(row.base_balance.toFixed(2)), historic_rate: Number(historicRate.toFixed(8)), closing_rate: Number(rate.exchange_rate), closing_rate_date: rate.rate_date, revalued_base_balance: Number(revalued.toFixed(2)), difference_amount: Number(difference.toFixed(2)) });
+    }
+    return { as_of: asOf, functional_currency_code: functionalCurrency, lines: preview, total_gain: Number(preview.filter((row) => row.difference_amount > 0).reduce((sum, row) => sum + row.difference_amount, 0).toFixed(2)), total_loss: Number(Math.abs(preview.filter((row) => row.difference_amount < 0).reduce((sum, row) => sum + row.difference_amount, 0)).toFixed(2)) };
+  }
+}

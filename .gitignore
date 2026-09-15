@@ -1,0 +1,86 @@
+# Dependencies
+node_modules
+
+# SSH keys / secrets (never commit)
+*.pem
+*.key
+.pnp
+.pnp.js
+
+# Testing
+coverage
+*.log
+
+# Next.js
+.next/
+out/
+build
+dist/
+
+# Production
+.vercel
+.turbo
+
+# Environment Variables
+.env
+.env*.local
+.env.production
+
+# App-specific env files
+apps/api/.env.openai
+apps/api/.env.openai.*
+
+# IDEs
+.vscode/*
+!.vscode/settings.json
+!.vscode/extensions.json
+.idea
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Debug
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+
+# TypeScript
+*.tsbuildinfo
+
+# Database
+*.db
+*.db-journal
+
+# Docker
+.docker/
+
+# Security Keys (NEVER COMMIT!)
+*.pem
+*.key
+*.ppk
+
+# Misc
+.cache
+temp/
+tmp/
+
+# Temp scripts / deploy archives
+tmp-*
+deploy-temp/
+*.tar.gz
+*.tgz
+*.zip
+.deploy-stamp.tmp
+.deploy_stamp_*.txt
+qa-results/
+backups/
+backup/
+scripts/temp-set-gmail-oauth.sh
+sak-erp-deploy.tgz
+web-deploy.tgz
+*-deploy.tgz
+deploy-*.tar.gz

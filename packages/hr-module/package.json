@@ -1,0 +1,40 @@
+{
+  "name": "@sak-erp/hr-module",
+  "version": "1.0.0",
+  "description": "Standalone HR & Payroll Management Module - Industry Standard with UAE Compliance",
+  "main": "dist/index.js",
+  "types": "dist/index.d.ts",
+  "scripts": {
+    "build": "tsc",
+    "dev": "tsc --watch",
+    "test": "jest"
+  },
+  "keywords": [
+    "hr",
+    "payroll",
+    "attendance",
+    "leave-management",
+    "performance-management",
+    "uae-compliance",
+    "wps",
+    "end-of-service-benefits"
+  ],
+  "author": "SAK Solutions",
+  "license": "MIT",
+  "peerDependencies": {
+    "react": "^18.0.0",
+    "next": "^14.0.0"
+  },
+  "dependencies": {
+    "date-fns": "^2.30.0",
+    "zod": "^3.22.0"
+  },
+  "devDependencies": {
+    "@types/react": "^18.0.0",
+    "@types/node": "^20.0.0",
+    "typescript": "^5.0.0"
+  },
+  "publishConfig": {
+    "access": "public"
+  }
+}

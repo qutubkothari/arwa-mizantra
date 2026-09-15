@@ -1,0 +1,626 @@
+import {
+  Controller,
+  Get,
+  Post,
+  Put,
+  Body,
+  Param,
+  Query,
+  UseGuards,
+  Request,
+  UseInterceptors,
+  UploadedFiles,
+  Delete,
+  Res,
+} from '@nestjs/common';
+import type { Response } from 'express';
+import { FilesInterceptor } from '@nestjs/platform-express';
+import { memoryStorage } from 'multer';
+import { ServiceService } from '../services/service.service';
+import { JwtAuthGuard } from '../../auth/guards/jwt-auth.guard';
+import { PermissionsGuard } from '../../auth/guards/permissions.guard';
+import {
+  RequireCreate,
+  RequireDelete,
+  RequireUpdate,
+} from '../../auth/decorators/permissions.decorator';
+
+@Controller('service')
+@UseGuards(JwtAuthGuard, PermissionsGuard)
+export class ServiceController {
+  constructor(private readonly serviceService: ServiceService) {}
+
+  // ==================== Service Tickets ====================
+
+  @Post('tickets')
+  @RequireCreate('service')
+  async createServiceTicket(@Request() req: any, @Body() body: any) {
+    return this.serviceService.createServiceTicket(
+      req.user.tenantId,
+      req.user.userId,
+      body,
+    );
+  }
+
+  @Post('uploads')
+  @UseInterceptors(
+    FilesInterceptor('files', 10, {
+      storage: memoryStorage(),
+      limits: {
+        fileSize: 50 * 1024 * 1024, // 50MB
+      },
+    }),
+  )
+  async uploadServiceAttachments(
+    @Request() req: any,
+    @UploadedFiles() files: Array<Express.Multer.File>,
+  ) {
+    const urls = await this.serviceService.uploadServiceAttachments(
+      req.user.tenantId,
+      req.user.userId,
+      files,
+    );
+
+    return { urls };
+  }
+
+  @Get('tickets')
+  async getServiceTickets(@Request() req: any, @Query() query: any) {
+    return this.serviceService.getServiceTickets(req.user.tenantId, query);
+  }
+
+  @Get('tickets/:id')
+  async getServiceTicketById(@Request() req: any, @Param('id') id: string) {
+    return this.serviceService.getServiceTicketById(req.user.tenantId, id);
+  }
+
+  @Put('tickets/:id')
+  @RequireUpdate('service')
+  async updateServiceTicket(
+    @Request() req: any,
+    @Param('id') id: string,
+    @Body() body: any,
+  ) {
+    return this.serviceService.updateServiceTicket(
+      req.user.tenantId,
+      id,
+      body,
+    );
+  }
+
+  @Delete('tickets/:id')
+  @RequireDelete('service')
+  async deleteServiceTicket(@Request() req: any, @Param('id') id: string) {
+    return this.serviceService.deleteServiceTicket(req.user.tenantId, id);
+  }
+
+  @Post('tickets/:id/close')
+  @RequireUpdate('service')
+  async closeServiceTicket(
+    @Request() req: any,
+    @Param('id') id: string,
+    @Body() body: any,
+  ) {
+    return this.serviceService.closeServiceTicket(
+      req.user.tenantId,
+      id,
+      req.user.userId,
+      body,
+    );
+  }
+
+  // ==================== Warranty Validation ====================
+
+  @Get('warranty/validate/:uid')
+  async validateWarranty(@Request() req: any, @Param('uid') uid: string) {
+    return this.serviceService.validateWarrantyForUID(req.user.tenantId, uid);
+  }
+
+  // ==================== Technicians ====================
+
+  @Post('technicians')
+  @RequireCreate('service')
+  async createTechnician(@Request() req: any, @Body() body: any) {
+    return this.serviceService.createTechnician(req.user.tenantId, body);
+  }
+
+  @Get('technicians')
+  async getTechnicians(@Request() req: any, @Query('active_only') activeOnly?: string) {
+    return this.serviceService.getTechnicians(
+      req.user.tenantId,
+      activeOnly !== 'false',
+    );
+  }
+
+  @Get('technicians/eligible-employees')
+  async getEligibleTechnicianEmployees(@Request() req: any) {
+    return this.serviceService.getEligibleTechnicianEmployees(req.user.tenantId);
+  }
+
+  @Get('tickets/:id/estimates')
+  async getServiceEstimates(@Request() req: any, @Param('id') id: string) {
+    return this.serviceService.getServiceEstimates(req.user.tenantId, id);
+  }
+
+  @Post('tickets/:id/estimates')
+  @RequireCreate('service')
+  async createServiceEstimate(@Request() req: any, @Param('id') id: string, @Body() body: any) {
+    return this.serviceService.createServiceEstimate(req.user.tenantId, req.user.userId, id, body);
+  }
+
+  @Post('estimates/:id/revise')
+  @RequireUpdate('service')
+  async reviseServiceEstimate(@Request() req: any, @Param('id') id: string, @Body() body: any) {
+    return this.serviceService.reviseServiceEstimate(req.user.tenantId, req.user.userId, id, body);
+  }
+
+  @Get('estimates/:id/pdf')
+  async downloadServiceEstimatePdf(
+    @Request() req: any,
+    @Param('id') id: string,
+    @Res() response: Response,
+  ) {
+    const document = await this.serviceService.renderServiceEstimatePdf(req.user.tenantId, id);
+    response.setHeader('Content-Type', 'application/pdf');
+    response.setHeader('Content-Disposition', `attachment; filename="${document.fileName}"`);
+    response.setHeader('Cache-Control', 'private, no-store');
+    response.send(document.buffer);
+  }
+
+  @Post('estimates/:id/decision')
+  @RequireUpdate('service')
+  async decideServiceEstimate(@Request() req: any, @Param('id') id: string, @Body() body: any) {
+    return this.serviceService.decideServiceEstimate(req.user.tenantId, req.user.userId, id, body);
+  }
+
+  @Post('estimates/:id/send-email')
+  @RequireUpdate('service')
+  async sendServiceEstimateEmail(@Request() req: any, @Param('id') id: string, @Body() body: any) {
+    return this.serviceService.sendServiceEstimateEmail(req.user.tenantId, req.user.userId, id, body);
+  }
+
+  @Post('estimates/:id/customer-comment')
+  @RequireUpdate('service')
+  async recordServiceEstimateCustomerComment(@Request() req: any, @Param('id') id: string, @Body() body: any) {
+    return this.serviceService.recordServiceEstimateCustomerComment(req.user.tenantId, req.user.userId, id, body);
+  }
+
+  @Put('technicians/:id')
+  @RequireUpdate('service')
+  async updateTechnician(
+    @Request() req: any,
+    @Param('id') id: string,
+    @Body() body: any,
+  ) {
+    return this.serviceService.updateTechnician(req.user.tenantId, id, body);
+  }
+
+  @Delete('technicians/:id')
+  @RequireDelete('service')
+  async deleteTechnician(@Request() req: any, @Param('id') id: string) {
+    return this.serviceService.deleteTechnician(req.user.tenantId, id);
+  }
+
+  @Get('technicians/capacity/day')
+  async getTechnicianCapacity(@Request() req: any, @Query('date') date?: string) {
+    return this.serviceService.getTechnicianCapacity(req.user.tenantId, date);
+  }
+
+  // ==================== Failure Codes & Escalations ====================
+
+  @Get('failure-codes')
+  async getServiceFailureCodes(@Request() req: any, @Query('active_only') activeOnly?: string) {
+    return this.serviceService.getServiceFailureCodes(req.user.tenantId, activeOnly !== 'false');
+  }
+
+  @Post('failure-codes')
+  @RequireCreate('service')
+  async createServiceFailureCode(@Request() req: any, @Body() body: any) {
+    return this.serviceService.createServiceFailureCode(req.user.tenantId, req.user.userId, body);
+  }
+
+  @Put('failure-codes/:id')
+  @RequireUpdate('service')
+  async updateServiceFailureCode(@Request() req: any, @Param('id') id: string, @Body() body: any) {
+    return this.serviceService.updateServiceFailureCode(req.user.tenantId, id, body);
+  }
+
+  @Delete('failure-codes/:id')
+  @RequireDelete('service')
+  async deleteServiceFailureCode(@Request() req: any, @Param('id') id: string) {
+    return this.serviceService.deleteServiceFailureCode(req.user.tenantId, id);
+  }
+
+  @Get('escalations')
+  async getServiceEscalations(@Request() req: any, @Query() query: any) {
+    return this.serviceService.getServiceEscalations(req.user.tenantId, query);
+  }
+
+  @Post('tickets/:id/escalations')
+  @RequireUpdate('service')
+  async createServiceEscalation(@Request() req: any, @Param('id') id: string, @Body() body: any) {
+    return this.serviceService.createServiceEscalation(req.user.tenantId, req.user.userId, id, body);
+  }
+
+  @Put('escalations/:id')
+  @RequireUpdate('service')
+  async updateServiceEscalation(@Request() req: any, @Param('id') id: string, @Body() body: any) {
+    return this.serviceService.updateServiceEscalation(req.user.tenantId, id, body);
+  }
+
+  // ==================== Repair / RMA ====================
+
+  @Get('rma-orders')
+  async getServiceRmaOrders(@Request() req: any, @Query() query: any) {
+    return this.serviceService.getServiceRmaOrders(req.user.tenantId, query);
+  }
+
+  @Post('rma-orders')
+  @RequireCreate('service')
+  async createServiceRmaOrder(@Request() req: any, @Body() body: any) {
+    return this.serviceService.createServiceRmaOrder(req.user.tenantId, req.user.userId, body);
+  }
+
+  @Put('rma-orders/:id')
+  @RequireUpdate('service')
+  async updateServiceRmaOrder(@Request() req: any, @Param('id') id: string, @Body() body: any) {
+    return this.serviceService.updateServiceRmaOrder(req.user.tenantId, id, body);
+  }
+
+  // ==================== Service Assignments ====================
+
+  @Post('assignments')
+  @RequireCreate('service')
+  async assignTechnician(@Request() req: any, @Body() body: any) {
+    return this.serviceService.assignTechnician(
+      req.user.tenantId,
+      req.user.userId,
+      body,
+    );
+  }
+
+  @Get('assignments/technician/:technicianId')
+  async getAssignmentsByTechnician(
+    @Request() req: any,
+    @Param('technicianId') technicianId: string,
+    @Query('status') status?: string,
+  ) {
+    return this.serviceService.getAssignmentsByTechnician(req.user.tenantId, technicianId, status);
+  }
+
+  @Put('assignments/:id')
+  @RequireUpdate('service')
+  async updateAssignment(@Request() req: any, @Param('id') id: string, @Body() body: any) {
+    return this.serviceService.updateAssignment(req.user.tenantId, id, body);
+  }
+
+  // ==================== Field Service Site Visits ====================
+
+  @Get('tickets/:id/visits')
+  async getServiceVisits(@Request() req: any, @Param('id') id: string) {
+    return this.serviceService.getServiceVisits(req.user.tenantId, id);
+  }
+
+  @Post('tickets/:id/visits/check-in')
+  @RequireUpdate('service')
+  async checkInServiceVisit(
+    @Request() req: any,
+    @Param('id') id: string,
+    @Body() body: any,
+  ) {
+    return this.serviceService.checkInServiceVisit(req.user.tenantId, req.user.userId, id, body);
+  }
+
+  @Put('visits/:id/check-out')
+  @RequireUpdate('service')
+  async checkOutServiceVisit(
+    @Request() req: any,
+    @Param('id') id: string,
+    @Body() body: any,
+  ) {
+    return this.serviceService.checkOutServiceVisit(req.user.tenantId, req.user.userId, id, body);
+  }
+
+  // ==================== Controlled Service Checklists ====================
+
+  @Get('checklist-templates')
+  async getChecklistTemplates(@Request() req: any, @Query('active_only') activeOnly?: string) {
+    return this.serviceService.getChecklistTemplates(req.user.tenantId, activeOnly !== 'false');
+  }
+
+  @Post('checklist-templates')
+  @RequireCreate('service')
+  async createChecklistTemplate(@Request() req: any, @Body() body: any) {
+    return this.serviceService.createChecklistTemplate(req.user.tenantId, req.user.userId, body);
+  }
+
+  @Put('checklist-templates/:id')
+  @RequireUpdate('service')
+  async updateChecklistTemplate(@Request() req: any, @Param('id') id: string, @Body() body: any) {
+    return this.serviceService.updateChecklistTemplate(req.user.tenantId, id, body);
+  }
+
+  @Delete('checklist-templates/:id')
+  @RequireDelete('service')
+  async deactivateChecklistTemplate(@Request() req: any, @Param('id') id: string) {
+    return this.serviceService.deactivateChecklistTemplate(req.user.tenantId, id);
+  }
+
+  @Get('tickets/:id/checklist')
+  async getTicketChecklist(@Request() req: any, @Param('id') id: string) {
+    return this.serviceService.getTicketChecklist(req.user.tenantId, id);
+  }
+
+  @Post('tickets/:id/checklist')
+  @RequireUpdate('service')
+  async assignTicketChecklist(@Request() req: any, @Param('id') id: string, @Body() body: any) {
+    return this.serviceService.assignTicketChecklist(req.user.tenantId, req.user.userId, id, body);
+  }
+
+  @Put('tickets/:ticketId/checklist/:itemId')
+  @RequireUpdate('service')
+  async updateTicketChecklistItem(@Request() req: any, @Param('ticketId') ticketId: string, @Param('itemId') itemId: string, @Body() body: any) {
+    return this.serviceService.updateTicketChecklistItem(req.user.tenantId, req.user.userId, ticketId, itemId, body);
+  }
+
+  // ==================== Service Parts Used ====================
+
+  @Post('parts')
+  @RequireCreate('service')
+  async addServicePart(@Request() req: any, @Body() body: any) {
+    return this.serviceService.addServicePart(req, body);
+  }
+
+  @Get('parts/ticket/:ticketId')
+  async getServicePartsByTicket(@Request() req: any, @Param('ticketId') ticketId: string) {
+    return this.serviceService.getServicePartsByTicket(req.user.tenantId, ticketId);
+  }
+
+  // ==================== Service History ====================
+
+  @Get('history/:uid')
+  async getServiceHistoryByUID(@Request() req: any, @Param('uid') uid: string) {
+    return this.serviceService.getServiceHistoryByUID(req.user.tenantId, uid);
+  }
+
+  // ==================== Confirmations / Billing / Document Flow ====================
+
+  @Get('tickets/:id/confirmations')
+  async getServiceConfirmations(@Request() req: any, @Param('id') id: string) {
+    return this.serviceService.getServiceConfirmations(req.user.tenantId, id);
+  }
+
+  @Post('tickets/:id/confirmations')
+  @RequireCreate('service')
+  async createServiceConfirmation(
+    @Request() req: any,
+    @Param('id') id: string,
+    @Body() body: any,
+  ) {
+    return this.serviceService.createServiceConfirmation(req.user.tenantId, req.user.userId, id, body);
+  }
+
+  @Get('tickets/:id/document-flow')
+  async getServiceDocumentFlow(@Request() req: any, @Param('id') id: string) {
+    return this.serviceService.getServiceDocumentFlow(req.user.tenantId, id);
+  }
+
+  @Get('tickets/:id/feedback')
+  async getServiceFeedback(@Request() req: any, @Param('id') id: string) {
+    return this.serviceService.getServiceFeedback(req.user.tenantId, id);
+  }
+
+  @Post('tickets/:id/feedback')
+  @RequireCreate('service')
+  async recordServiceFeedback(
+    @Request() req: any,
+    @Param('id') id: string,
+    @Body() body: any,
+  ) {
+    return this.serviceService.recordServiceFeedback(
+      req.user.tenantId,
+      req.user.userId,
+      id,
+      body,
+    );
+  }
+
+  // ==================== Installed Base / Contracts ====================
+
+  @Get('installed-assets')
+  async getInstalledAssets(@Request() req: any, @Query() query: any) {
+    return this.serviceService.getInstalledAssets(req.user.tenantId, query);
+  }
+
+  @Post('installed-assets')
+  @RequireCreate('service')
+  async createInstalledAsset(@Request() req: any, @Body() body: any) {
+    return this.serviceService.createInstalledAsset(req.user.tenantId, req.user.userId, body);
+  }
+
+  @Put('installed-assets/:id')
+  @RequireUpdate('service')
+  async updateInstalledAsset(@Request() req: any, @Param('id') id: string, @Body() body: any) {
+    return this.serviceService.updateInstalledAsset(req.user.tenantId, id, body);
+  }
+
+  @Delete('installed-assets/:id')
+  @RequireDelete('service')
+  async deleteInstalledAsset(@Request() req: any, @Param('id') id: string) {
+    return this.serviceService.deleteInstalledAsset(req.user.tenantId, id);
+  }
+
+  @Get('contracts')
+  async getServiceContracts(@Request() req: any, @Query() query: any) {
+    return this.serviceService.getServiceContracts(req.user.tenantId, query);
+  }
+
+  @Post('contracts')
+  @RequireCreate('service')
+  async createServiceContract(@Request() req: any, @Body() body: any) {
+    return this.serviceService.createServiceContract(req.user.tenantId, req.user.userId, body);
+  }
+
+  @Put('contracts/:id')
+  @RequireUpdate('service')
+  async updateServiceContract(@Request() req: any, @Param('id') id: string, @Body() body: any) {
+    return this.serviceService.updateServiceContract(req.user.tenantId, id, body);
+  }
+
+  @Post('contracts/:id/renew')
+  @RequireCreate('service')
+  async renewServiceContract(@Request() req: any, @Param('id') id: string, @Body() body: any) {
+    return this.serviceService.renewServiceContract(req.user.tenantId, req.user.userId, id, body);
+  }
+
+  @Delete('contracts/:id')
+  @RequireDelete('service')
+  async deleteServiceContract(@Request() req: any, @Param('id') id: string) {
+    return this.serviceService.deleteServiceContract(req.user.tenantId, id);
+  }
+
+  @Get('maintenance-schedules')
+  async getMaintenanceSchedules(@Request() req: any, @Query() query: any) {
+    return this.serviceService.getMaintenanceSchedules(req.user.tenantId, query);
+  }
+
+  @Post('maintenance-schedules')
+  @RequireCreate('service')
+  async createMaintenanceSchedule(@Request() req: any, @Body() body: any) {
+    return this.serviceService.createMaintenanceSchedule(req.user.tenantId, req.user.userId, body);
+  }
+
+  @Put('maintenance-schedules/:id')
+  @RequireUpdate('service')
+  async updateMaintenanceSchedule(@Request() req: any, @Param('id') id: string, @Body() body: any) {
+    return this.serviceService.updateMaintenanceSchedule(req.user.tenantId, id, body);
+  }
+
+  @Delete('maintenance-schedules/:id')
+  @RequireDelete('service')
+  async deleteMaintenanceSchedule(@Request() req: any, @Param('id') id: string) {
+    return this.serviceService.deleteMaintenanceSchedule(req.user.tenantId, id);
+  }
+
+  @Post('maintenance-schedules/:id/generate-ticket')
+  @RequireCreate('service')
+  async generateMaintenanceTicket(@Request() req: any, @Param('id') id: string) {
+    return this.serviceService.generateMaintenanceTicket(req.user.tenantId, req.user.userId, id);
+  }
+
+  @Get('customer-invoices')
+  async getCustomerServiceInvoices(@Request() req: any, @Query() query: any) {
+    return this.serviceService.getCustomerServiceInvoices(req.user.tenantId, query);
+  }
+
+  @Get('customer-invoices/:id')
+  async getCustomerServiceInvoiceById(@Request() req: any, @Param('id') id: string) {
+    return this.serviceService.getCustomerServiceInvoiceById(req.user.tenantId, id);
+  }
+
+  @Get('customer-invoices/:id/pdf')
+  async downloadCustomerServiceInvoicePdf(
+    @Request() req: any,
+    @Param('id') id: string,
+    @Res() response: Response,
+  ) {
+    const document = await this.serviceService.renderCustomerServiceInvoicePdf(req.user.tenantId, id);
+    response.setHeader('Content-Type', 'application/pdf');
+    response.setHeader('Content-Disposition', `attachment; filename="${document.fileName}"`);
+    response.setHeader('Cache-Control', 'private, no-store');
+    response.send(document.buffer);
+  }
+
+  @Post('customer-invoices/:id/send-email')
+  @RequireUpdate('service')
+  async sendCustomerServiceInvoiceEmail(
+    @Request() req: any,
+    @Param('id') id: string,
+    @Body() body: any,
+  ) {
+    return this.serviceService.sendCustomerServiceInvoiceEmail(req.user.tenantId, id, body);
+  }
+
+  @Post('confirmations/:id/create-invoice')
+  @RequireCreate('service')
+  async createCustomerServiceInvoice(
+    @Request() req: any,
+    @Param('id') id: string,
+    @Body() body: any,
+  ) {
+    return this.serviceService.createCustomerServiceInvoice(req.user.tenantId, req.user.userId, id, body);
+  }
+
+  @Post('customer-invoices/:id/payments')
+  @RequireUpdate('service')
+  async recordCustomerServicePayment(
+    @Request() req: any,
+    @Param('id') id: string,
+    @Body() body: any,
+  ) {
+    return this.serviceService.recordCustomerServicePayment(req.user.tenantId, req.user.userId, id, body);
+  }
+
+  @Get('customer-invoices/:invoiceId/payments/:paymentId/pdf')
+  async downloadCustomerServiceReceiptPdf(
+    @Request() req: any,
+    @Param('invoiceId') invoiceId: string,
+    @Param('paymentId') paymentId: string,
+    @Res() response: Response,
+  ) {
+    const document = await this.serviceService.renderCustomerServiceReceiptPdf(
+      req.user.tenantId,
+      invoiceId,
+      paymentId,
+    );
+    response.setHeader('Content-Type', 'application/pdf');
+    response.setHeader('Content-Disposition', `attachment; filename="${document.fileName}"`);
+    response.setHeader('Cache-Control', 'private, no-store');
+    response.send(document.buffer);
+  }
+
+  @Post('customer-invoices/:invoiceId/payments/:paymentId/send-email')
+  @RequireUpdate('service')
+  async sendCustomerServiceReceiptEmail(
+    @Request() req: any,
+    @Param('invoiceId') invoiceId: string,
+    @Param('paymentId') paymentId: string,
+    @Body() body: any,
+  ) {
+    return this.serviceService.sendCustomerServiceReceiptEmail(req.user.tenantId, invoiceId, paymentId, body);
+  }
+
+  @Post('customer-invoices/:id/collection-action')
+  @RequireUpdate('service')
+  async recordCustomerServiceCollectionAction(
+    @Request() req: any,
+    @Param('id') id: string,
+    @Body() body: any,
+  ) {
+    return this.serviceService.recordCustomerServiceCollectionAction(
+      req.user.tenantId,
+      req.user.userId,
+      id,
+      body,
+    );
+  }
+
+  @Post('customer-invoices/:id/cancel')
+  @RequireUpdate('service')
+  async cancelCustomerServiceInvoice(@Request() req: any, @Param('id') id: string, @Body() body: any) {
+    return this.serviceService.cancelCustomerServiceInvoice(req.user.tenantId, req.user.userId, id, body);
+  }
+
+  @Post('customer-invoices/:invoiceId/payments/:paymentId/reverse')
+  @RequireUpdate('service')
+  async reverseCustomerServicePayment(@Request() req: any, @Param('invoiceId') invoiceId: string, @Param('paymentId') paymentId: string, @Body() body: any) {
+    return this.serviceService.reverseCustomerServicePayment(req.user.tenantId, req.user.userId, invoiceId, paymentId, body);
+  }
+
+  // ==================== Reports ====================
+
+  @Get('reports')
+  async getServiceReports(@Request() req: any, @Query() query: any) {
+    return this.serviceService.getServiceReports(req.user.tenantId, query);
+  }
+}

@@ -1,0 +1,32 @@
+'use client';
+
+import Link from 'next/link';
+import { FormEvent, useCallback, useEffect, useState } from 'react';
+import { ArrowLeft, CheckCircle2, Play, RefreshCw, UploadCloud } from 'lucide-react';
+import { apiClient } from '../../../../../lib/api-client';
+
+const DATASETS = ['CUSTOMERS','SUPPLIERS','ITEMS','BOMS','OPENING_BALANCES','INVENTORY','CHART_OF_ACCOUNTS','PURCHASE_HISTORY','SALES_HISTORY'];
+type Batch = { id:string; dataset_type:string; source_name?:string; status:string; summary:{total:number;auto_accepted:number;review_required:number;acceptance_rate_pct:number}; created_at:string };
+
+export default function OnboardingPage() {
+  const [dataset,setDataset] = useState('ITEMS');
+  const [source,setSource] = useState('Pasted test data');
+  const [json,setJson] = useState('[\n  {"item_code":"RM-001","item_name":"Test material","uom":"KG","category":"RAW_MATERIAL","hsn_code":"7604"}\n]');
+  const [batches,setBatches] = useState<Batch[]>([]); const [result,setResult] = useState<any>(null);
+  const [error,setError] = useState(''); const [busy,setBusy] = useState(false);
+  const load = useCallback(async () => { try { setBatches(await apiClient.get<Batch[]>('/intelligence/onboarding/batches')); } catch (e:any) { setError(e?.message || 'Unable to load onboarding batches.'); } }, []);
+  useEffect(() => { load(); }, [load]);
+  const analyse = async (event:FormEvent) => { event.preventDefault(); setBusy(true); setError(''); try { const rows=JSON.parse(json); if(!Array.isArray(rows)) throw new Error('Input must be a JSON array.'); setResult(await apiClient.post('/intelligence/onboarding/analyse',{dataset_type:dataset,source_name:source,rows})); await load(); } catch(e:any) { setError(e?.message||'Unable to analyse onboarding data.'); } finally { setBusy(false); } };
+  const approve = async (id:string) => { setBusy(true); setError(''); try { await apiClient.patch(`/intelligence/onboarding/batches/${id}/approve`,{}); await load(); } catch(e:any) { setError(e?.message||'Unable to approve the onboarding batch.'); } finally { setBusy(false); } };
+  const apply = async (id:string) => { setBusy(true); setError(''); try { await apiClient.post(`/intelligence/onboarding/batches/${id}/apply`,{}); await load(); } catch(e:any) { setError(e?.message||'Unable to apply the approved onboarding batch.'); } finally { setBusy(false); } };
+
+  return <main className="mx-auto max-w-7xl space-y-4 p-4 text-[#2F241B]">
+    <header className="border border-[#D8C8AA] bg-[#FBF7EF] p-5"><Link href="/dashboard/command-center" className="inline-flex items-center gap-1 text-xs font-semibold text-[#80613D]"><ArrowLeft className="h-3 w-3"/>Command Center</Link><h1 className="mt-2 flex items-center gap-2 text-2xl font-bold"><UploadCloud className="h-6 w-6"/>Self-configuring onboarding</h1><p className="mt-1 text-sm text-[#6F5A45]">Infer mappings, isolate exceptions and apply independently approved data through native controls.</p></header>
+    {error && <p className="border border-red-200 bg-red-50 p-3 text-sm text-red-800">{error}</p>}
+    <section className="grid gap-4 lg:grid-cols-2">
+      <form onSubmit={analyse} className="space-y-3 border border-[#E0D2B8] bg-white p-4"><div className="grid gap-3 sm:grid-cols-2"><label className="text-xs font-semibold">Dataset<select value={dataset} onChange={e=>setDataset(e.target.value)} className="mt-1 w-full border border-[#D8C8AA] p-2 text-sm">{DATASETS.map(value=><option key={value}>{value}</option>)}</select></label><label className="text-xs font-semibold">Source<input value={source} onChange={e=>setSource(e.target.value)} className="mt-1 w-full border border-[#D8C8AA] p-2 text-sm"/></label></div><label className="block text-xs font-semibold">Rows as JSON array<textarea value={json} onChange={e=>setJson(e.target.value)} rows={14} className="mt-1 w-full border border-[#D8C8AA] p-2 font-mono text-xs"/></label><button disabled={busy} className="w-full bg-[#65452B] px-3 py-2 text-sm font-semibold text-white">{busy?'Analysing…':'Analyse without posting'}</button></form>
+      <div className="border border-[#E0D2B8] bg-white p-4"><h2 className="font-bold">Latest analysis</h2>{result?<><div className="mt-3 grid grid-cols-3 gap-2">{[['Total',result.summary.total],['Auto accepted',result.summary.auto_accepted],['Review',result.summary.review_required]].map(([label,value])=><div key={String(label)} className="bg-[#FBF7EF] p-3"><p className="text-xs text-[#80613D]">{label}</p><b className="text-xl">{value}</b></div>)}</div><p className="mt-3 text-xs"><b>Inferred mapping:</b> {JSON.stringify(result.inferred_mapping)}</p><div className="mt-3 max-h-72 overflow-auto">{(result.exceptions||[]).map((row:any)=><div key={row.row_number} className="border-t p-2 text-xs"><b>Row {row.row_number}</b> {row.issues.map((issue:any)=>`${issue.code}: ${issue.field}`).join(', ')}</div>)}</div></>:<p className="mt-3 text-sm text-[#6F5A45]">No analysis run in this session.</p>}</div>
+    </section>
+    <section className="border border-[#E0D2B8] bg-white"><div className="flex items-center justify-between p-4"><div><h2 className="font-bold">Onboarding batches</h2><p className="text-xs text-[#6F5A45]">Analyse → independent approval → controlled native application.</p></div><button onClick={load}><RefreshCw className="h-4 w-4"/></button></div>{batches.map(batch=><div key={batch.id} className="flex flex-wrap items-center justify-between gap-3 border-t p-4 text-sm"><div><b>{batch.dataset_type}</b><p className="text-xs text-[#6F5A45]">{batch.source_name||'Unnamed source'} · {batch.summary.auto_accepted}/{batch.summary.total} automatically accepted</p></div><div className="flex items-center gap-2"><span className="border border-[#D8C8AA] px-2 py-1 text-xs font-bold">{batch.status}</span>{['ANALYSED','REVIEW_REQUIRED'].includes(batch.status)&&batch.summary.review_required===0&&<button disabled={busy} onClick={()=>approve(batch.id)} className="inline-flex items-center gap-1 bg-emerald-700 px-2 py-1 text-xs font-semibold text-white"><CheckCircle2 className="h-3 w-3"/>Independent approval</button>}{batch.status==='APPROVED'&&<button disabled={busy} onClick={()=>apply(batch.id)} className="inline-flex items-center gap-1 bg-[#65452B] px-2 py-1 text-xs font-semibold text-white"><Play className="h-3 w-3"/>Apply through native controls</button>}</div></div>)}{!batches.length&&<p className="border-t p-8 text-center text-sm text-[#6F5A45]">No onboarding batches.</p>}</section>
+  </main>;
+}

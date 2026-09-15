@@ -1,0 +1,2 @@
+import { Controller, Get, Req, UseGuards } from '@nestjs/common'; import { JwtAuthGuard } from '../auth/guards/jwt-auth.guard'; import { PermissionsGuard } from '../auth/guards/permissions.guard'; import { CollectionsService } from './collections.service';
+@Controller('collections') @UseGuards(JwtAuthGuard, PermissionsGuard) export class CollectionsController { constructor(private readonly service: CollectionsService) {} @Get('worklist') worklist(@Req() req: any) { return this.service.worklist(req.user.tenantId); } }

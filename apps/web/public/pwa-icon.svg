@@ -1,0 +1,7 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512" role="img" aria-label="Mizantra ERP">
+  <rect width="512" height="512" rx="112" fill="#8B6F47"/>
+  <rect x="52" y="52" width="408" height="408" rx="86" fill="#FAF9F6" opacity=".12"/>
+  <path d="M136 347h240v42H136v-42Zm0-224h240v42H136v-42Zm0 92h240v42H136v-42Z" fill="#FFFDF8"/>
+  <path d="M136 281h146v42H136v-42Z" fill="#E8DCC4"/>
+  <text x="256" y="300" text-anchor="middle" font-family="Arial, Helvetica, sans-serif" font-weight="800" font-size="86" fill="#FFFDF8">SAK</text>
+</svg>

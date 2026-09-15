@@ -1,0 +1,27 @@
+{
+  "name": "@sak-erp/database",
+  "version": "1.0.0",
+  "private": true,
+  "main": "./src/index.ts",
+  "types": "./src/index.ts",
+  "scripts": {
+    "migrate": "prisma migrate dev",
+    "migrate:deploy": "prisma migrate deploy",
+    "generate": "prisma generate",
+    "studio": "prisma studio",
+    "seed": "tsx src/seed.ts",
+    "db:push": "prisma db push",
+    "db:reset": "prisma migrate reset"
+  },
+  "prisma": {
+    "seed": "tsx src/seed.ts"
+  },
+  "dependencies": {
+    "@prisma/client": "^5.19.0",
+    "prisma": "^5.19.0"
+  },
+  "devDependencies": {
+    "@faker-js/faker": "^8.4.1",
+    "tsx": "^4.20.6"
+  }
+}

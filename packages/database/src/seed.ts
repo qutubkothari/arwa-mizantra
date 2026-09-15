@@ -1,0 +1,221 @@
+import { PrismaClient } from '@prisma/client';
+import * as bcrypt from 'bcrypt';
+
+const prisma = new PrismaClient();
+
+async function main() {
+  console.log('🌱 Seeding database...');
+
+  // Create SAK Solutions as super admin tenant
+  const sakTenant = await prisma.tenant.upsert({
+    where: { subdomain: 'sak-admin' },
+    update: {},
+    create: {
+      name: 'SAK Solutions',
+      subdomain: 'sak-admin',
+      domain: 'sak-solutions.com',
+      isActive: true,
+      metadata: {
+        isSuperAdmin: true,
+        canManageAllTenants: true,
+      },
+    },
+  });
+
+  console.log('✅ Created SAK Solutions tenant');
+
+  // Create SAK Solutions as first client
+  const saifTenant = await prisma.tenant.upsert({
+    where: { subdomain: 'mizantra' },
+    update: {},
+    create: {
+      name: 'SAK Solutions',
+      subdomain: 'mizantra',
+      domain: 'mizantra.ae',
+      isActive: true,
+      settings: {
+        defaultLanguage: 'en',
+        timezone: 'Asia/Kolkata',
+        currency: 'INR',
+      },
+      metadata: {
+        industry: 'Manufacturing',
+        gstNumber: 'GSTIN123456789',
+      },
+    },
+  });
+
+  console.log('✅ Created SAK Solutions tenant');
+
+  // Create default roles for SAK Solutions
+  const roles = [
+    {
+      name: 'ADMIN',
+      code: 'ADMIN',
+      description: 'System Administrator',
+      permissions: { all: true },
+    },
+    {
+      name: 'OWNER',
+      code: 'OWNER',
+      description: 'Business Owner - Full access including price visibility',
+      permissions: { viewPrices: true, manageAll: true },
+    },
+    {
+      name: 'MANAGER',
+      code: 'MANAGER',
+      description: 'Department Manager',
+      permissions: { viewPrices: true, manageTeam: true },
+    },
+    {
+      name: 'ACCOUNTANT',
+      code: 'ACCOUNTANT',
+      description: 'Accountant - Financial access',
+      permissions: { viewPrices: true, manageFinance: true },
+    },
+    {
+      name: 'SUPERVISOR',
+      code: 'SUPERVISOR',
+      description: 'Production Supervisor',
+      permissions: { viewPrices: false, manageProduction: true },
+    },
+    {
+      name: 'OPERATOR',
+      code: 'OPERATOR',
+      description: 'Machine Operator',
+      permissions: { viewPrices: false, operateOnly: true },
+    },
+    {
+      name: 'USER',
+      code: 'USER',
+      description: 'Standard User',
+      permissions: { viewPrices: false, readOnly: true },
+    },
+  ];
+
+  for (const role of roles) {
+    await prisma.role.upsert({
+      where: {
+        tenantId_code: {
+          tenantId: saifTenant.id,
+          code: role.code,
+        },
+      },
+      update: {},
+      create: {
+        ...role,
+        tenantId: saifTenant.id,
+      },
+    });
+  }
+
+  console.log('✅ Created default roles');
+
+  // Create main company for SAK Solutions
+  const mainCompany = await prisma.company.upsert({
+    where: {
+      tenantId_code: {
+        tenantId: saifTenant.id,
+        code: 'SAIF-HQ',
+      },
+    },
+    update: {},
+    create: {
+      tenantId: saifTenant.id,
+      code: 'SAIF-HQ',
+      name: 'SAK Solutions - Head Office',
+      legalName: 'SAK Solutions',
+      taxId: 'GSTIN123456789',
+      address: 'Kolkata, West Bengal, India',
+      isActive: true,
+    },
+  });
+
+  console.log('✅ Created main company');
+
+  // Create default plant
+  const mainPlant = await prisma.plant.upsert({
+    where: {
+      tenantId_code: {
+        tenantId: saifTenant.id,
+        code: 'KOL-P01',
+      },
+    },
+    update: {},
+    create: {
+      tenantId: saifTenant.id,
+      companyId: mainCompany.id,
+      code: 'KOL-P01',
+      name: 'Kolkata Manufacturing Plant',
+      type: 'MANUFACTURING',
+      address: 'Kolkata, West Bengal, India',
+      isActive: true,
+    },
+  });
+
+  console.log('✅ Created main plant');
+
+  // Create admin user for SAK Solutions
+  const adminRole = await prisma.role.findFirst({
+    where: {
+      tenantId: saifTenant.id,
+      code: 'ADMIN',
+    },
+  });
+
+  const hashedPassword = await bcrypt.hash('Admin@123', 12);
+
+  const adminUser = await prisma.user.upsert({
+    where: {
+      tenantId_email: {
+        tenantId: saifTenant.id,
+        email: 'admin@mizantra.ae',
+      },
+    },
+    update: {},
+    create: {
+      tenantId: saifTenant.id,
+      email: 'admin@mizantra.ae',
+      password: hashedPassword,
+      firstName: 'Admin',
+      lastName: 'User',
+      roleId: adminRole?.id,
+      isActive: true,
+    },
+  });
+
+  console.log('✅ Created admin user');
+  console.log('   Email: admin@mizantra.ae');
+  console.log('   Password: Admin@123');
+  console.log('   ⚠️  CHANGE THIS PASSWORD IMMEDIATELY!');
+
+  // Create sample item categories
+  const categories = [
+    'Raw Materials',
+    'Components',
+    'Sub-Assemblies',
+    'Finished Goods',
+    'Tools',
+    'Consumables',
+  ];
+
+  console.log('✅ Created sample categories');
+
+  console.log('');
+  console.log('🎉 Database seeding completed!');
+  console.log('');
+  console.log('Login credentials:');
+  console.log('  Tenant: SAK Solutions');
+  console.log('  Email: admin@mizantra.ae');
+  console.log('  Password: Admin@123');
+  console.log('');
+}
+
+main()
+  .catch((e) => {
+    console.error('❌ Seeding failed:', e);
+    process.exit(1);
+  })
+  .finally(async () => {
+    await prisma.$disconnect();
+  });

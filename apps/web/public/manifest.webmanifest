@@ -1,0 +1,49 @@
+{
+  "name": "Mizantra ERP by SAK Solutions",
+  "short_name": "Mizantra ERP",
+  "description": "Manufacturing ERP for procurement, inventory, production, accounts, HR, and traceability.",
+  "start_url": "/dashboard",
+  "scope": "/",
+  "display": "standalone",
+  "display_override": ["window-controls-overlay", "standalone", "browser"],
+  "orientation": "any",
+  "background_color": "#FAF9F6",
+  "theme_color": "#8B6F47",
+  "categories": ["business", "productivity"],
+  "lang": "en-GB",
+  "dir": "ltr",
+  "icons": [
+    {
+      "src": "/pwa-icon-192.png",
+      "sizes": "192x192",
+      "type": "image/png",
+      "purpose": "any"
+    },
+    {
+      "src": "/pwa-icon-512.png",
+      "sizes": "512x512",
+      "type": "image/png",
+      "purpose": "any"
+    }
+  ],
+  "shortcuts": [
+    {
+      "name": "Purchase Requisitions",
+      "short_name": "PR",
+      "url": "/dashboard/purchase/requisitions",
+      "icons": [{ "src": "/pwa-icon-192.png", "sizes": "192x192", "type": "image/png" }]
+    },
+    {
+      "name": "Purchase Orders",
+      "short_name": "PO",
+      "url": "/dashboard/purchase/orders",
+      "icons": [{ "src": "/pwa-icon-192.png", "sizes": "192x192", "type": "image/png" }]
+    },
+    {
+      "name": "GRN",
+      "short_name": "GRN",
+      "url": "/dashboard/purchase/grn",
+      "icons": [{ "src": "/pwa-icon-192.png", "sizes": "192x192", "type": "image/png" }]
+    }
+  ]
+}

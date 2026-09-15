@@ -1,0 +1,112 @@
+import { Body, Controller, Delete, Get, Param, Patch, Post, Query, Req, UseGuards, UseInterceptors, UploadedFile, BadRequestException } from '@nestjs/common';
+import { JwtAuthGuard } from '../auth/guards/jwt-auth.guard';
+import { PermissionsGuard } from '../auth/guards/permissions.guard';
+import { AccountingService } from './accounting.service';
+import { FileInterceptor } from '@nestjs/platform-express';
+import { memoryStorage } from 'multer';
+
+@Controller('accounting')
+@UseGuards(JwtAuthGuard, PermissionsGuard)
+export class AccountingController {
+  constructor(private readonly accounting: AccountingService) {}
+
+  @Get('accounts') listAccounts(@Req() req: any, @Query() query: any) { return this.accounting.listAccounts(req.user.tenantId, query); }
+  @Post('accounts') createAccount(@Req() req: any, @Body() body: any) { return this.accounting.createAccount(req.user.tenantId, req.user.id, body); }
+  @Post('accounts/seed-defaults') seedDefaultAccounts(@Req() req: any) { return this.accounting.seedDefaultAccounts(req.user.tenantId, req.user.id); }
+  @Patch('accounts/:id') updateAccount(@Req() req: any, @Param('id') id: string, @Body() body: any) { return this.accounting.updateAccount(req.user.tenantId, id, body); }
+  @Get('accounts/:id/ledger') accountLedger(@Req() req: any, @Param('id') id: string, @Query() query: any) { return this.accounting.accountLedger(req.user.tenantId, id, query); }
+  @Get('cost-centres') listCostCentres(@Req() req: any, @Query() query: any) { return this.accounting.listCostCentres(req.user.tenantId, query); }
+  @Post('cost-centres') createCostCentre(@Req() req: any, @Body() body: any) { return this.accounting.createCostCentre(req.user.tenantId, req.user.id, body); }
+  @Patch('cost-centres/:id') updateCostCentre(@Req() req: any, @Param('id') id: string, @Body() body: any) { return this.accounting.updateCostCentre(req.user.tenantId, id, body); }
+  @Get('posting-rules') postingRules(@Req() req: any) { return this.accounting.listPostingRules(req.user.tenantId); }
+  @Post('posting-rules') createPostingRule(@Req() req: any, @Body() body: any) { return this.accounting.createPostingRule(req.user.tenantId, req.user.id, body); }
+  @Patch('posting-rules/:id') updatePostingRule(@Req() req: any, @Param('id') id: string, @Body() body: any) { return this.accounting.updatePostingRule(req.user.tenantId, id, body); }
+  @Post('posting-rules/:id/create-draft') createPostingRuleDraft(@Req() req: any, @Param('id') id: string, @Body() body: any) { return this.accounting.createPostingRuleDraft(req.user.tenantId, req.user.id, id, body); }
+  @Get('workflow-roles') workflowRoles(@Req() req: any) { return this.accounting.listWorkflowRoleAssignments(req.user.tenantId); }
+  @Get('segregation-of-duties') segregationOfDuties(@Req() req: any) { return this.accounting.segregationOfDutiesReview(req.user.tenantId); }
+  @Get('workflow-users') workflowUsers(@Req() req: any) { return this.accounting.listWorkflowUsers(req.user.tenantId); }
+  @Post('workflow-roles') setWorkflowRole(@Req() req: any, @Body() body: any) { return this.accounting.setWorkflowRoleAssignment(req.user.tenantId, req.user, body); }
+  @Post('operational-postings') createOperationalPosting(@Req() req: any, @Body() body: any) { return this.accounting.createOperationalPosting(req.user.tenantId, req.user, body); }
+  @Get('exchange-rates') exchangeRates(@Req() req: any, @Query() query: any) { return this.accounting.listExchangeRates(req.user.tenantId, query); }
+  @Get('fx-revaluation/preview') fxRevaluationPreview(@Req() req: any, @Query() query: any) { return this.accounting.fxRevaluationPreview(req.user.tenantId, query); }
+  @Post('exchange-rates') createExchangeRate(@Req() req: any, @Body() body: any) { return this.accounting.createExchangeRate(req.user.tenantId, req.user.id, body); }
+  @Patch('exchange-rates/:id') updateExchangeRate(@Req() req: any, @Param('id') id: string, @Body() body: any) { return this.accounting.updateExchangeRate(req.user.tenantId, id, body); }
+  @Get('recurring-journals') recurringJournals(@Req() req: any) { return this.accounting.listRecurringJournals(req.user.tenantId); }
+  @Post('recurring-journals') createRecurringJournal(@Req() req: any, @Body() body: any) { return this.accounting.createRecurringJournal(req.user.tenantId, req.user.id, body); }
+  @Patch('recurring-journals/:id') updateRecurringJournal(@Req() req: any, @Param('id') id: string, @Body() body: any) { return this.accounting.updateRecurringJournal(req.user.tenantId, id, body); }
+  @Post('recurring-journals/:id/generate') generateRecurringJournal(@Req() req: any, @Param('id') id: string, @Body() body: any) { return this.accounting.generateRecurringJournal(req.user.tenantId, req.user.id, id, body); }
+  @Get('periods') listPeriods(@Req() req: any) { return this.accounting.listPeriods(req.user.tenantId); }
+  @Post('periods') createPeriod(@Req() req: any, @Body() body: any) { return this.accounting.createPeriod(req.user.tenantId, body); }
+  @Get('periods/:id/close-checklist') periodCloseChecklist(@Req() req: any, @Param('id') id: string) { return this.accounting.periodCloseChecklist(req.user.tenantId, id); }
+  @Get('periods/:id/tasks') periodCloseTasks(@Req() req: any, @Param('id') id: string) { return this.accounting.periodCloseTasks(req.user.tenantId, id); }
+  @Patch('period-close-tasks/:id') updatePeriodCloseTask(@Req() req: any, @Param('id') id: string, @Body() body: any) { return this.accounting.updatePeriodCloseTask(req.user.tenantId, req.user, id, body); }
+  @Patch('periods/:id/close') closePeriod(@Req() req: any, @Param('id') id: string) { return this.accounting.closePeriod(req.user.tenantId, id, req.user.id); }
+  @Patch('periods/:id/lock') lockPeriod(@Req() req: any, @Param('id') id: string) { return this.accounting.lockPeriod(req.user.tenantId, id, req.user.id); }
+  @Get('journals') listJournals(@Req() req: any, @Query() query: any) { return this.accounting.listJournals(req.user.tenantId, query); }
+  @Post('journals') createJournal(@Req() req: any, @Body() body: any) { return this.accounting.createJournal(req.user.tenantId, req.user, body); }
+  @Get('journals/:id') getJournal(@Req() req: any, @Param('id') id: string) { return this.accounting.getJournal(req.user.tenantId, id); }
+  @Post('journals/:id/attachments')
+  @UseInterceptors(FileInterceptor('file', { storage: memoryStorage(), limits: { fileSize: 25 * 1024 * 1024 } }))
+  addJournalAttachment(@Req() req: any, @Param('id') id: string, @UploadedFile() file: Express.Multer.File, @Body() body: any) {
+    if (!file) throw new BadRequestException('Choose a supporting document to upload.');
+    return this.accounting.addJournalAttachment(req.user.tenantId, req.user.id, id, file, body?.note);
+  }
+  @Patch('journals/:id') updateJournal(@Req() req: any, @Param('id') id: string, @Body() body: any) { return this.accounting.updateJournal(req.user.tenantId, id, body); }
+  @Delete('journals/:id') deleteJournal(@Req() req: any, @Param('id') id: string) { return this.accounting.deleteJournal(req.user.tenantId, id); }
+  @Post('journals/:id/review') reviewJournal(@Req() req: any, @Param('id') id: string, @Body() body: any) { return this.accounting.reviewJournal(req.user.tenantId, req.user, id, body); }
+  @Post('journals/:id/approve') approveJournal(@Req() req: any, @Param('id') id: string, @Body() body: any) { return this.accounting.approveJournal(req.user.tenantId, req.user, id, body); }
+  @Post('journals/:id/post') postJournal(@Req() req: any, @Param('id') id: string) { return this.accounting.postJournal(req.user.tenantId, id, req.user); }
+  @Get('trial-balance') trialBalance(@Req() req: any, @Query() query: any) { return this.accounting.trialBalance(req.user.tenantId, query); }
+  @Get('reports/profit-loss') profitLoss(@Req() req: any, @Query() query: any) { return this.accounting.profitLoss(req.user.tenantId, query); }
+  @Get('reports/balance-sheet') balanceSheet(@Req() req: any, @Query() query: any) { return this.accounting.balanceSheet(req.user.tenantId, query); }
+  @Get('reports/cash-flow') cashFlow(@Req() req: any, @Query() query: any) { return this.accounting.cashFlow(req.user.tenantId, query); }
+  @Get('reports/cash-forecast') cashForecast(@Req() req: any, @Query() query: any) { return this.accounting.cashForecast(req.user.tenantId, query); }
+  @Get('reports/cost-centres') costCentres(@Req() req: any, @Query() query: any) { return this.accounting.costCentreReport(req.user.tenantId, query); }
+  @Get('reports/comparative-financials') comparativeFinancials(@Req() req: any, @Query() query: any) { return this.accounting.comparativeFinancials(req.user.tenantId, query); }
+  @Get('audit-trail') accountingAuditTrail(@Req() req: any, @Query() query: any) { return this.accounting.accountingAuditTrail(req.user.tenantId, query); }
+  @Get('suspense') suspense(@Req() req: any, @Query() query: any) { return this.accounting.suspenseAccounts(req.user.tenantId, query); }
+  @Post('journals/:id/reverse') reverseJournal(@Req() req: any, @Param('id') id: string, @Body() body: any) { return this.accounting.reverseJournal(req.user.tenantId, req.user.id, id, body); }
+  @Get('open-items') openItems(@Req() req: any, @Query() query: any) { return this.accounting.listOpenItems(req.user.tenantId, query); }
+  @Get('parties') parties(@Req() req: any, @Query() query: any) { return this.accounting.listParties(req.user.tenantId, query); }
+  @Get('parties/:id/statement') partyStatement(@Req() req: any, @Param('id') id: string, @Query() query: any) { return this.accounting.partyStatement(req.user.tenantId, id, query); }
+  @Post('parties') createParty(@Req() req: any, @Body() body: any) { return this.accounting.createParty(req.user.tenantId, body); }
+  @Patch('parties/:id') updateParty(@Req() req: any, @Param('id') id: string, @Body() body: any) { return this.accounting.updateParty(req.user.tenantId, id, body); }
+  @Post('open-items') createOpenItem(@Req() req: any, @Body() body: any) { return this.accounting.createOpenItem(req.user.tenantId, body); }
+  @Post('open-items/:id/settle') settleOpenItem(@Req() req: any, @Param('id') id: string, @Body() body: any) { return this.accounting.settleOpenItem(req.user.tenantId, req.user.id, id, body); }
+  @Post('payment-vouchers') paymentVoucher(@Req() req: any, @Body() body: any) { return this.accounting.createPaymentVoucher(req.user.tenantId, req.user.id, body); }
+  @Get('payment-runs') paymentRuns(@Req() req: any) { return this.accounting.listPaymentRuns(req.user.tenantId); }
+  @Post('payment-runs') createPaymentRun(@Req() req: any, @Body() body: any) { return this.accounting.createPaymentRun(req.user.tenantId, req.user, body); }
+  @Post('payment-runs/:id/approve') approvePaymentRun(@Req() req: any, @Param('id') id: string) { return this.accounting.approvePaymentRun(req.user.tenantId, req.user, id); }
+  @Post('payment-runs/:id/post') postPaymentRun(@Req() req: any, @Param('id') id: string) { return this.accounting.postPaymentRun(req.user.tenantId, req.user, id); }
+  @Get('payment-runs/:id/remittances') paymentRunRemittances(@Req() req: any, @Param('id') id: string) { return this.accounting.paymentRunRemittances(req.user.tenantId, id); }
+  @Post('payment-runs/:id/remittances') preparePaymentRunRemittances(@Req() req: any, @Param('id') id: string, @Body() body: any) { return this.accounting.preparePaymentRunRemittances(req.user.tenantId, req.user, id, body); }
+  @Post('remittances/:id/mark-sent') markRemittanceSent(@Req() req: any, @Param('id') id: string, @Body() body: any) { return this.accounting.markRemittanceSent(req.user.tenantId, req.user, id, body); }
+  @Get('opening-balances') openingBalanceBatches(@Req() req: any) { return this.accounting.listOpeningBalanceBatches(req.user.tenantId); }
+  @Post('opening-balances') createOpeningBalanceBatch(@Req() req: any, @Body() body: any) { return this.accounting.createOpeningBalanceBatch(req.user.tenantId, req.user.id, body); }
+  @Post('opening-balances/:id/validate') validateOpeningBalanceBatch(@Req() req: any, @Param('id') id: string) { return this.accounting.validateOpeningBalanceBatch(req.user.tenantId, req.user.id, id); }
+  @Post('opening-balances/:id/post') postOpeningBalanceBatch(@Req() req: any, @Param('id') id: string) { return this.accounting.postOpeningBalanceBatch(req.user.tenantId, req.user.id, id); }
+  @Get('statutory-returns') statutoryReturns(@Req() req: any) { return this.accounting.listStatutoryReturns(req.user.tenantId); }
+  @Post('statutory-returns') createStatutoryReturn(@Req() req: any, @Body() body: any) { return this.accounting.createStatutoryReturn(req.user.tenantId, req.user.id, body); }
+  @Patch('statutory-returns/:id') updateStatutoryReturn(@Req() req: any, @Param('id') id: string, @Body() body: any) { return this.accounting.updateStatutoryReturn(req.user.tenantId, req.user.id, id, body); }
+  @Get('report-schedules') reportSchedules(@Req() req: any) { return this.accounting.listReportSchedules(req.user.tenantId); }
+  @Post('report-schedules') createReportSchedule(@Req() req: any, @Body() body: any) { return this.accounting.createReportSchedule(req.user.tenantId, req.user.id, body); }
+  @Patch('report-schedules/:id') updateReportSchedule(@Req() req: any, @Param('id') id: string, @Body() body: any) { return this.accounting.updateReportSchedule(req.user.tenantId, id, body); }
+  @Get('reports/ageing') ageing(@Req() req: any, @Query('direction') direction: string, @Query('as_of') asOf?: string) { return this.accounting.ageing(req.user.tenantId, direction || 'RECEIVABLE', asOf); }
+  @Get('bank-accounts') bankAccounts(@Req() req: any) { return this.accounting.listBankAccounts(req.user.tenantId); }
+  @Post('bank-accounts') createBankAccount(@Req() req: any, @Body() body: any) { return this.accounting.createBankAccount(req.user.tenantId, body); }
+  @Get('bank-transactions') bankTransactions(@Req() req: any, @Query() query: any) { return this.accounting.listBankTransactions(req.user.tenantId, query); }
+  @Post('bank-transactions') createBankTransaction(@Req() req: any, @Body() body: any) { return this.accounting.createBankTransaction(req.user.tenantId, body); }
+  @Post('bank-transactions/import') importBankTransactions(@Req() req: any, @Body() body: any) { return this.accounting.importBankTransactions(req.user.tenantId, body); }
+  @Post('bank-transactions/:id/reconcile') reconcileBankTransaction(@Req() req: any, @Param('id') id: string, @Body() body: any) { return this.accounting.reconcileBankTransaction(req.user.tenantId, id, body); }
+  @Get('tax-codes') taxCodes(@Req() req: any) { return this.accounting.listTaxCodes(req.user.tenantId); }
+  @Get('tax-register') taxRegister(@Req() req: any, @Query() query: any) { return this.accounting.taxRegister(req.user.tenantId, query); }
+  @Post('tax-codes') createTaxCode(@Req() req: any, @Body() body: any) { return this.accounting.createTaxCode(req.user.tenantId, body); }
+  @Get('fixed-assets') fixedAssets(@Req() req: any) { return this.accounting.listAssets(req.user.tenantId); }
+  @Post('fixed-assets') createFixedAsset(@Req() req: any, @Body() body: any) { return this.accounting.createAsset(req.user.tenantId, body); }
+  @Get('fixed-assets/depreciation') depreciation(@Req() req: any, @Query('as_of') asOf?: string) { return this.accounting.calculateDepreciation(req.user.tenantId, asOf); }
+  @Post('fixed-assets/depreciation/post') postDepreciation(@Req() req: any, @Body() body: any) { return this.accounting.postDepreciation(req.user.tenantId, req.user.id, body); }
+  @Get('budgets') budgets(@Req() req: any) { return this.accounting.listBudgets(req.user.tenantId); }
+  @Post('budgets') createBudget(@Req() req: any, @Body() body: any) { return this.accounting.createBudget(req.user.tenantId, req.user.id, body); }
+  @Post('budgets/:id/approve') approveBudget(@Req() req: any, @Param('id') id: string) { return this.accounting.approveBudget(req.user.tenantId, id); }
+  @Get('budgets/:id/variance') budgetVariance(@Req() req: any, @Param('id') id: string, @Query() query: any) { return this.accounting.budgetVariance(req.user.tenantId, id, query); }
+}

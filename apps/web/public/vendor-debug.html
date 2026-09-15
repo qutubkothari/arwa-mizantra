@@ -1,0 +1,74 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <title>Vendor Debug Test</title>
+</head>
+<body>
+    <h1>Vendor Debug Test</h1>
+    <button onclick="testVendors()">Test Vendors API</button>
+    <button onclick="checkAuth()">Check Auth</button>
+    <pre id="output"></pre>
+
+    <script>
+        function log(msg) {
+            document.getElementById('output').textContent += msg + '\n';
+        }
+
+        function checkAuth() {
+            document.getElementById('output').textContent = '';
+            const token = localStorage.getItem('accessToken');
+            if (token) {
+                log('✅ Access token found');
+                log('Token: ' + token.substring(0, 20) + '...');
+            } else {
+                log('❌ No access token in localStorage');
+                log('Please log in first!');
+            }
+        }
+
+        async function testVendors() {
+            document.getElementById('output').textContent = '';
+            
+            const token = localStorage.getItem('accessToken');
+            if (!token) {
+                log('❌ No access token! Please log in first.');
+                return;
+            }
+
+            log('Testing vendors API...\n');
+            
+            try {
+                const response = await fetch('/api/v1/purchase/vendors', {
+                    headers: {
+                        'Authorization': `Bearer ${token}`
+                    }
+                });
+
+                log(`Status: ${response.status} ${response.statusText}`);
+                
+                const data = await response.json();
+                
+                if (Array.isArray(data)) {
+                    log(`\n✅ SUCCESS! Received ${data.length} vendors`);
+                    if (data.length > 0) {
+                        log('\nFirst 5 vendors:');
+                        data.slice(0, 5).forEach((v, i) => {
+                            log(`${i + 1}. ${v.name} (${v.code})`);
+                        });
+                    } else {
+                        log('\n⚠️ Vendors array is empty!');
+                    }
+                } else {
+                    log('\nResponse:');
+                    log(JSON.stringify(data, null, 2));
+                }
+            } catch (error) {
+                log(`\n❌ Error: ${error.message}`);
+            }
+        }
+        
+        // Auto-check auth on load
+        window.addEventListener('load', checkAuth);
+    </script>
+</body>
+</html>

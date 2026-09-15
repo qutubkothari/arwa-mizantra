@@ -1,0 +1,48 @@
+{
+  "name": "@sak-erp/monorepo",
+  "version": "1.0.0",
+  "private": true,
+  "description": "SAK Solutions Manufacturing ERP - Multi-tenant, Multi-language, Multi-plant",
+  "workspaces": [
+    "apps/*",
+    "packages/*",
+    "services/*"
+  ],
+  "scripts": {
+    "dev": "turbo run dev",
+    "build": "turbo run build",
+    "test": "turbo run test",
+    "lint": "turbo run lint",
+    "vendor:audit": "node verify-vendors-import-audit.js",
+    "qa:ai:release-gate": "node scripts/qa/active-planner-deep-language-context-live.cjs",
+    "format": "prettier --write \"**/*.{ts,tsx,js,jsx,json,md}\"",
+    "clean": "turbo run clean && rm -rf node_modules",
+    "docker:dev": "docker-compose up -d",
+    "docker:down": "docker-compose down",
+    "db:migrate": "pnpm --filter @sak-erp/database migrate",
+    "db:seed": "pnpm --filter @sak-erp/database seed",
+    "db:studio": "pnpm --filter @sak-erp/database studio"
+  },
+  "devDependencies": {
+    "@turbo/gen": "^2.0.0",
+    "@types/pdf-parse": "^1.1.4",
+    "eslint": "^8.57.0",
+    "exceljs": "^4.4.0",
+    "pg": "^8.16.3",
+    "playwright": "^1.61.1",
+    "prettier": "^3.3.3",
+    "turbo": "^2.0.0",
+    "typescript": "^5.5.0"
+  },
+  "engines": {
+    "node": ">=20.0.0",
+    "pnpm": ">=9.0.0"
+  },
+  "packageManager": "pnpm@9.0.0",
+  "dependencies": {
+    "@supabase/supabase-js": "^2.86.0",
+    "dotenv": "^17.2.3",
+    "pdf-parse": "^1.1.1",
+    "xlsx": "^0.18.5"
+  }
+}

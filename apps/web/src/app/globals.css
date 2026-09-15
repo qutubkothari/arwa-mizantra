@@ -1,0 +1,403 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+@layer utilities {
+  /* Smart Data Tables overrides - letting content breathe */
+  .erp-data-table table {
+    width: 100% !important;
+    min-width: 0 !important;
+  }
+  
+  .erp-data-table table th,
+  .erp-data-table table td {
+    padding: 0.875rem 1rem;
+    font-size: 0.875rem;
+    line-height: 1.25rem;
+  }
+
+  .erp-list-table-scroll {
+    overflow-x: scroll !important;
+    overflow-y: visible;
+    max-width: 100%;
+    overscroll-behavior-x: contain;
+    scrollbar-width: thin;
+    scrollbar-color: #9ca3af #f3f4f6;
+  }
+
+  .erp-list-table-scroll::-webkit-scrollbar {
+    display: block;
+    height: 12px;
+  }
+
+  .erp-list-table-scroll::-webkit-scrollbar-track {
+    background: #f3f4f6;
+  }
+
+  .erp-list-table-scroll::-webkit-scrollbar-thumb {
+    background: #9ca3af;
+    border: 2px solid #f3f4f6;
+    border-radius: 9999px;
+  }
+
+  .scrollbar-none {
+    scrollbar-width: none;
+  }
+
+  .scrollbar-none::-webkit-scrollbar {
+    display: none;
+  }
+
+  main .container,
+  main [class*="max-w-7xl"][class*="mx-auto"]:not([class*="max-h"]),
+  main [class*="max-w-6xl"][class*="mx-auto"]:not([class*="max-h"]) {
+    max-width: none !important;
+  }
+}
+
+@layer base {
+  :root {
+    /* SAIF brand theme - warm beige, brown, and white */
+    --background: 43 33% 97%;
+    --foreground: 25 32% 22%;
+    
+    --card: 0 0% 100%;
+    --card-foreground: 25 32% 22%;
+    
+    --popover: 0 0% 100%;
+    --popover-foreground: 25 32% 22%;
+    
+    --primary: 35 32% 41%;
+    --primary-foreground: 0 0% 100%;
+    
+    --secondary: 40 47% 93%;
+    --secondary-foreground: 25 33% 33%;
+    
+    --muted: 38 33% 95%;
+    --muted-foreground: 27 18% 41%;
+    
+    --accent: 40 47% 93%;
+    --accent-foreground: 25 33% 33%;
+    
+    --destructive: 0 84.2% 60.2%;
+    --destructive-foreground: 0 0% 100%;
+    
+    --success: 142.1 76.2% 36.3%;
+    --success-foreground: 355.7 100% 97.3%;
+    
+    --warning: 38 92% 50%;
+    --warning-foreground: 48 96% 89%;
+    
+    --border: 39 37% 84%;
+    --input: 39 37% 84%;
+    --ring: 35 32% 41%;
+    
+    --radius: 0.5rem;
+  }
+
+  .dark {
+    /* Warm dark mode - brown and cream, without blue-black tones */
+    --background: 25 31% 13%;
+    --foreground: 40 42% 92%;
+    
+    --card: 25 29% 18%;
+    --card-foreground: 40 42% 92%;
+    
+    --popover: 25 29% 18%;
+    --popover-foreground: 40 42% 92%;
+    
+    --primary: 35 31% 57%;
+    --primary-foreground: 25 31% 13%;
+    
+    --secondary: 27 25% 25%;
+    --secondary-foreground: 40 42% 92%;
+    
+    --muted: 27 25% 25%;
+    --muted-foreground: 35 23% 70%;
+    
+    --accent: 27 25% 25%;
+    --accent-foreground: 40 42% 92%;
+    
+    --destructive: 0 62.8% 30.6%;
+    --destructive-foreground: 40 42% 92%;
+    
+    --success: 142.1 76.2% 26.3%;
+    --success-foreground: 355.7 100% 97.3%;
+    
+    --warning: 38 92% 40%;
+    --warning-foreground: 48 96% 89%;
+    
+    --border: 28 22% 31%;
+    --input: 28 22% 31%;
+    --ring: 35 31% 57%;
+  }
+}
+
+@layer base {
+  * {
+    @apply border-border;
+  }
+  body {
+    @apply bg-background text-foreground;
+    font-feature-settings: "rlig" 1, "calt" 1;
+    overflow-x: hidden;
+  }
+
+  html {
+    overflow-x: hidden;
+  }
+
+  /* Wide ERP grids use visible horizontal scrolling, matching SAP list-report behavior. */
+  .overflow-x-auto {
+    scrollbar-width: thin;
+    scrollbar-color: #9ca3af #f3f4f6;
+  }
+
+  .overflow-x-auto {
+    overflow-y: visible;
+  }
+  
+  .overflow-x-auto::-webkit-scrollbar {
+    display: block;
+    height: 12px;
+  }
+
+  .overflow-x-auto::-webkit-scrollbar-track {
+    background: #f3f4f6;
+  }
+
+  .overflow-x-auto::-webkit-scrollbar-thumb {
+    background: #9ca3af;
+    border: 2px solid #f3f4f6;
+    border-radius: 9999px;
+  }
+
+  /* Sticky table headers (global) */
+  table thead {
+    position: sticky;
+    top: 0;
+    z-index: 20;
+    background-color: inherit;
+  }
+
+  table thead th {
+    position: sticky;
+    top: 0;
+    z-index: 30;
+    background-color: inherit;
+    background-clip: padding-box;
+    box-shadow: 0 1px 0 rgba(0, 0, 0, 0.06);
+  }
+
+  /* Modal maximize/minimize controls */
+  .modal-panel {
+    position: relative;
+  }
+
+  .modal-toggle-btn {
+    position: absolute;
+    top: 0.75rem;
+    right: 3.25rem;
+    z-index: 20;
+    width: 2rem;
+    height: 2rem;
+    border-radius: 9999px;
+    border: 1px solid theme('colors.border');
+    background: theme('colors.card');
+    color: theme('colors.foreground');
+    font-size: 0.9rem;
+    line-height: 1;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    box-shadow: 0 1px 3px rgba(0, 0, 0, 0.1);
+  }
+
+  .modal-toggle-btn:hover {
+    background: theme('colors.muted.DEFAULT');
+  }
+
+  .modal-overlay.modal-maximized {
+    padding: 0 !important;
+    align-items: stretch !important;
+    justify-content: stretch !important;
+  }
+
+  .modal-panel.modal-maximized {
+    width: 100vw !important;
+    height: 100vh !important;
+    max-width: 100vw !important;
+    max-height: 100vh !important;
+    border-radius: 0 !important;
+    margin: 0 !important;
+    overflow: auto !important;
+  }
+
+  /* Sidebar scrollbar */
+  nav.overflow-y-auto {
+    scrollbar-width: thin;
+    scrollbar-color: #8B6F47 transparent;
+  }
+  
+  nav.overflow-y-auto::-webkit-scrollbar {
+    width: 4px;
+  }
+  
+  nav.overflow-y-auto::-webkit-scrollbar-track {
+    background: transparent;
+  }
+  
+  nav.overflow-y-auto::-webkit-scrollbar-thumb {
+    background: #8B6F47;
+    border-radius: 2px;
+  }
+  
+  /* Manufacturing-specific utilities */
+  .manufacturing-card {
+    @apply bg-card border border-border rounded-lg shadow-sm hover:shadow-md transition-shadow;
+  }
+  
+  .workstation-badge {
+    @apply inline-flex items-center px-3 py-1 rounded-full text-sm font-medium bg-accent text-accent-foreground;
+  }
+  
+  .uid-display {
+    @apply font-mono text-sm bg-muted px-2 py-1 rounded border border-border;
+  }
+  
+  .assembly-tree-line {
+    @apply border-l-2 border-primary/30;
+  }
+
+  /* Enterprise focus ring — used for keyboard nav accessibility */
+  .focus-ring {
+    @apply focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-primary focus-visible:ring-offset-2;
+  }
+
+  /* Badge variants */
+  .badge {
+    @apply inline-flex items-center rounded-full px-2.5 py-0.5 text-xs font-medium;
+  }
+  .badge-success { @apply bg-green-100 text-green-800; }
+  .badge-warning { @apply bg-amber-100 text-amber-800; }
+  .badge-danger  { @apply bg-red-100 text-red-800; }
+  .badge-info    { @apply bg-blue-100 text-blue-800; }
+  .badge-neutral { @apply bg-gray-100 text-gray-700; }
+
+  @media (max-width: 767px) {
+    html,
+    body {
+      width: 100%;
+      max-width: 100%;
+      overflow-x: hidden;
+      -webkit-text-size-adjust: 100%;
+    }
+
+    body {
+      padding-bottom: env(safe-area-inset-bottom);
+    }
+
+    main {
+      width: 100%;
+      max-width: 100vw;
+    }
+
+    input,
+    select,
+    textarea,
+    button {
+      font-size: 16px;
+    }
+
+    input,
+    select,
+    textarea {
+      max-width: 100%;
+    }
+
+    button,
+    a,
+    input,
+    select,
+    textarea {
+      touch-action: manipulation;
+    }
+
+    .mobile-full-bleed {
+      margin-left: -0.5rem;
+      margin-right: -0.5rem;
+      border-left-width: 0;
+      border-right-width: 0;
+      border-radius: 0;
+    }
+
+    .modal-panel.modal-maximized {
+      height: 100dvh !important;
+    }
+  }
+}
+
+/* ── Enterprise print styles ─────────────────────────────── */
+@media print {
+  /* Hide chrome elements during print */
+  aside,
+  nav,
+  .no-print,
+  [data-no-print] {
+    display: none !important;
+  }
+
+  main {
+    margin-left: 0 !important;
+    padding: 0 !important;
+  }
+
+  body {
+    font-size: 11pt;
+    color: black;
+    background: white;
+  }
+
+  .print-break-after  { page-break-after: always; }
+  .print-break-before { page-break-before: always; }
+  .print-break-inside { page-break-inside: avoid; }
+
+  table { border-collapse: collapse; }
+  table th, table td {
+    border: 1pt solid #999;
+    padding: 4pt 8pt;
+    font-size: 10pt;
+  }
+  table thead { background: #eee !important; }
+}
+
+/* Arabic application shell. Business codes and numeric inputs remain LTR. */
+html[dir="rtl"] body {
+  font-family: "Segoe UI", Tahoma, Arial, sans-serif;
+}
+html[dir="rtl"] .mizantra-sidebar {
+  left: auto !important;
+  right: 0 !important;
+  border-right-width: 0 !important;
+  border-left: 2px solid #6f4e37;
+}
+html[dir="rtl"] .dashboard-main-expanded {
+  margin-left: 0 !important;
+  margin-right: 14rem !important;
+}
+html[dir="rtl"] .dashboard-main-collapsed {
+  margin-left: 0 !important;
+  margin-right: 4rem !important;
+}
+html[dir="rtl"] input[type="number"],
+html[dir="rtl"] input[type="date"],
+html[dir="rtl"] [data-ltr] {
+  direction: ltr;
+  text-align: left;
+}
+@media (max-width: 767px) {
+  html[dir="rtl"] .dashboard-main-expanded,
+  html[dir="rtl"] .dashboard-main-collapsed {
+    margin-right: 0 !important;
+  }
+}
