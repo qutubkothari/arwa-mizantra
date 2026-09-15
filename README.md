@@ -16,6 +16,7 @@ The repository contains no production credentials. Use `apps/api/.env.arwa.examp
 
 ```bash
 pnpm install --frozen-lockfile
+pnpm exec prisma generate --schema packages/database/prisma/schema.prisma
 pnpm --filter @sak-erp/hr-module build
 pnpm --filter @sak-erp/api build
 pnpm --filter @sak-erp/web build
