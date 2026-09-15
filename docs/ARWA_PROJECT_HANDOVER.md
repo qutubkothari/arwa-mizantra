@@ -33,7 +33,7 @@ Saif customer records, employees, financial documents, inventory transactions an
 1. Merge and push a reviewed commit to the Arwa repository.
 2. Pull it into `/var/www/arwa-mizantra`.
 3. Validate the environment with the `arwa` deployment target guard.
-4. Install locked dependencies and build API and web.
+4. Install locked dependencies and build the HR workspace package, API and web.
 5. Restart only `arwa-mizantra-api` and `arwa-mizantra-web`.
 6. Verify the public URL, authentication, API protection and core smoke tests.
 
